@@ -1,11 +1,13 @@
+// Package index provides a merkletrie noder implementation for git index entries.
 package index
 
 import (
 	"path"
 	"strings"
 
-	"github.com/go-git/go-git/v5/plumbing/format/index"
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
 // The node represents a index.Entry or a directory inferred from the path
@@ -19,10 +21,23 @@ type node struct {
 	entry    *index.Entry
 	children []noder.Noder
 	isDir    bool
+	skip     bool
+
+	upholdExecutableBit bool
+}
+
+// RootNodeOptions contains configuration for the root node.
+type RootNodeOptions struct {
+	UpholdExecutableBit bool
 }
 
 // NewRootNode returns the root node of a computed tree from a index.Index,
 func NewRootNode(idx *index.Index) noder.Noder {
+	return NewRootNodeWithOptions(idx, RootNodeOptions{UpholdExecutableBit: true})
+}
+
+// NewRootNodeWithOptions returns the root node of a computed tree from a index.Index,
+func NewRootNodeWithOptions(idx *index.Index, options RootNodeOptions) noder.Noder {
 	const rootNode = ""
 
 	m := map[string]*node{rootNode: {isDir: true}}
@@ -35,11 +50,19 @@ func NewRootNode(idx *index.Index) noder.Noder {
 			parent := fullpath
 			fullpath = path.Join(fullpath, part)
 
-			if _, ok := m[fullpath]; ok {
+			// It's possible that the first occurrence of subdirectory is skipped.
+			// The parent node can be created with SkipWorktree set to true, but
+			// if any future children do not skip their subtree, the entire lineage
+			// of the tree needs to have this value set to false so that subdirectories
+			// are not ignored.
+			if parentNode, ok := m[fullpath]; ok {
+				if !e.SkipWorktree {
+					parentNode.skip = false
+				}
 				continue
 			}
 
-			n := &node{path: fullpath}
+			n := &node{path: fullpath, skip: e.SkipWorktree, upholdExecutableBit: options.UpholdExecutableBit}
 			if fullpath == e.Name {
 				n.entry = e
 			} else {
@@ -58,6 +81,10 @@ func (n *node) String() string {
 	return n.path
 }
 
+func (n *node) Skip() bool {
+	return n.skip
+}
+
 // Hash the hash of a filesystem is a 24-byte slice, is the result of
 // concatenating the computed plumbing.Hash of the file as a Blob and its
 // plumbing.FileMode; that way the difftree algorithm will detect changes in the
@@ -70,7 +97,12 @@ func (n *node) Hash() []byte {
 		return make([]byte, 24)
 	}
 
-	return append(n.entry.Hash[:], n.entry.Mode.Bytes()...)
+	mode := n.entry.Mode
+	if mode == filemode.Executable && !n.upholdExecutableBit {
+		mode = filemode.Regular
+	}
+
+	return append(n.entry.Hash.Bytes(), mode.Bytes()...)
 }
 
 func (n *node) Name() string {

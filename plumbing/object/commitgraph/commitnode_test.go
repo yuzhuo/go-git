@@ -4,35 +4,43 @@ import (
 	"path"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	"github.com/go-git/go-git/v5/plumbing/format/commitgraph"
-	"github.com/go-git/go-git/v5/plumbing/format/packfile"
-	"github.com/go-git/go-git/v5/storage/filesystem"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/suite"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	commitgraph "github.com/go-git/go-git/v6/plumbing/format/commitgraph"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
 type CommitNodeSuite struct {
-	fixtures.Suite
+	suite.Suite
 }
 
-var _ = Suite(&CommitNodeSuite{})
+func TestCommitNodeSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(CommitNodeSuite))
+}
 
-func unpackRepositry(f *fixtures.Fixture) *filesystem.Storage {
-	storer := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
-	p := f.Packfile()
+func unpackRepository(f *fixtures.Fixture) *filesystem.Storage {
+	dotgit, err := f.DotGit()
+	if err != nil {
+		panic(err)
+	}
+	storer := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+	p, err := f.Packfile()
+	if err != nil {
+		panic(err)
+	}
 	defer p.Close()
 	packfile.UpdateObjectStorage(storer, p)
 	return storer
 }
 
-func testWalker(c *C, nodeIndex CommitNodeIndex) {
+func testWalker(s *CommitNodeSuite, nodeIndex CommitNodeIndex) {
 	head, err := nodeIndex.Get(plumbing.NewHash("b9d69064b190e7aedccf84731ca1d917871f8a1c"))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	iter := NewCommitNodeIterCTime(
 		head,
@@ -46,7 +54,7 @@ func testWalker(c *C, nodeIndex CommitNodeIndex) {
 		return nil
 	})
 
-	c.Assert(commits, HasLen, 9)
+	s.Len(commits, 9)
 
 	expected := []string{
 		"b9d69064b190e7aedccf84731ca1d917871f8a1c",
@@ -60,13 +68,13 @@ func testWalker(c *C, nodeIndex CommitNodeIndex) {
 		"347c91919944a68e9413581a1bc15519550a3afe",
 	}
 	for i, commit := range commits {
-		c.Assert(commit.ID().String(), Equals, expected[i])
+		s.Equal(expected[i], commit.ID().String())
 	}
 }
 
-func testParents(c *C, nodeIndex CommitNodeIndex) {
+func testParents(s *CommitNodeSuite, nodeIndex CommitNodeIndex) {
 	merge3, err := nodeIndex.Get(plumbing.NewHash("6f6c5d2be7852c782be1dd13e36496dd7ad39560"))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	var parents []CommitNode
 	merge3.ParentNodes().ForEach(func(c CommitNode) error {
@@ -74,7 +82,7 @@ func testParents(c *C, nodeIndex CommitNodeIndex) {
 		return nil
 	})
 
-	c.Assert(parents, HasLen, 3)
+	s.Len(parents, 3)
 
 	expected := []string{
 		"ce275064ad67d51e99f026084e20827901a8361c",
@@ -82,67 +90,75 @@ func testParents(c *C, nodeIndex CommitNodeIndex) {
 		"a45273fe2d63300e1962a9e26a6b15c276cd7082",
 	}
 	for i, parent := range parents {
-		c.Assert(parent.ID().String(), Equals, expected[i])
+		s.Equal(expected[i], parent.ID().String())
 	}
 }
 
-func testCommitAndTree(c *C, nodeIndex CommitNodeIndex) {
+func testCommitAndTree(s *CommitNodeSuite, nodeIndex CommitNodeIndex) {
 	merge3node, err := nodeIndex.Get(plumbing.NewHash("6f6c5d2be7852c782be1dd13e36496dd7ad39560"))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	merge3commit, err := merge3node.Commit()
-	c.Assert(err, IsNil)
-	c.Assert(merge3node.ID().String(), Equals, merge3commit.ID().String())
+	s.NoError(err)
+	s.Equal(merge3commit.ID().String(), merge3node.ID().String())
 	tree, err := merge3node.Tree()
-	c.Assert(err, IsNil)
-	c.Assert(tree.ID().String(), Equals, merge3commit.TreeHash.String())
+	s.NoError(err)
+	s.Equal(merge3commit.TreeHash.String(), tree.ID().String())
 }
 
-func (s *CommitNodeSuite) TestObjectGraph(c *C) {
+func (s *CommitNodeSuite) TestObjectGraph() {
 	f := fixtures.ByTag("commit-graph").One()
-	storer := unpackRepositry(f)
+	storer := unpackRepository(f)
+	defer func() { _ = storer.Close() }()
 
 	nodeIndex := NewObjectCommitNodeIndex(storer)
-	testWalker(c, nodeIndex)
-	testParents(c, nodeIndex)
-	testCommitAndTree(c, nodeIndex)
+	testWalker(s, nodeIndex)
+	testParents(s, nodeIndex)
+	testCommitAndTree(s, nodeIndex)
 }
 
-func (s *CommitNodeSuite) TestCommitGraph(c *C) {
+func (s *CommitNodeSuite) TestCommitGraph() {
 	f := fixtures.ByTag("commit-graph").One()
-	storer := unpackRepositry(f)
+	storer := unpackRepository(f)
+	defer func() { _ = storer.Close() }()
 	reader, err := storer.Filesystem().Open(path.Join("objects", "info", "commit-graph"))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	defer reader.Close()
 	index, err := commitgraph.OpenFileIndex(reader)
-	c.Assert(err, IsNil)
+	s.NoError(err)
+	defer index.Close()
 
 	nodeIndex := NewGraphCommitNodeIndex(index, storer)
-	testWalker(c, nodeIndex)
-	testParents(c, nodeIndex)
-	testCommitAndTree(c, nodeIndex)
+	testWalker(s, nodeIndex)
+	testParents(s, nodeIndex)
+	testCommitAndTree(s, nodeIndex)
 }
 
-func (s *CommitNodeSuite) TestMixedGraph(c *C) {
+func (s *CommitNodeSuite) TestMixedGraph() {
 	f := fixtures.ByTag("commit-graph").One()
-	storer := unpackRepositry(f)
+	storer := unpackRepository(f)
+	defer func() { _ = storer.Close() }()
 
 	// Take the commit-graph file and copy it to memory index without the last commit
 	reader, err := storer.Filesystem().Open(path.Join("objects", "info", "commit-graph"))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	defer reader.Close()
 	fileIndex, err := commitgraph.OpenFileIndex(reader)
-	c.Assert(err, IsNil)
+	s.NoError(err)
+	defer fileIndex.Close()
+
 	memoryIndex := commitgraph.NewMemoryIndex()
+	defer memoryIndex.Close()
+
 	for i, hash := range fileIndex.Hashes() {
 		if hash.String() != "b9d69064b190e7aedccf84731ca1d917871f8a1c" {
-			node, err := fileIndex.GetCommitDataByIndex(i)
-			c.Assert(err, IsNil)
+			node, err := fileIndex.GetCommitDataByIndex(uint32(i))
+			s.NoError(err)
 			memoryIndex.Add(hash, node)
 		}
 	}
 
 	nodeIndex := NewGraphCommitNodeIndex(memoryIndex, storer)
-	testWalker(c, nodeIndex)
-	testParents(c, nodeIndex)
-	testCommitAndTree(c, nodeIndex)
+	testWalker(s, nodeIndex)
+	testParents(s, nodeIndex)
+	testCommitAndTree(s, nodeIndex)
 }

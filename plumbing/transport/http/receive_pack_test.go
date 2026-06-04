@@ -1,24 +1,38 @@
 package http
 
 import (
-	"github.com/go-git/go-git/v5/plumbing/transport/test"
+	"testing"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/go-git/go-git/v6/internal/transport/test"
+	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
-type ReceivePackSuite struct {
-	test.ReceivePackSuite
-	BaseSuite
+func TestReceivePackSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(receivePackSuite))
 }
 
-var _ = Suite(&ReceivePackSuite{})
+type receivePackSuite struct {
+	test.ReceivePackSuite
+}
 
-func (s *ReceivePackSuite) SetUpTest(c *C) {
-	s.BaseSuite.SetUpTest(c)
+func (s *receivePackSuite) SetupTest() {
+	base, addr := setupSmartServer(s.T())
 
-	s.ReceivePackSuite.Client = DefaultClient
-	s.ReceivePackSuite.Endpoint = s.prepareRepository(c, fixtures.Basic().One(), "basic.git")
-	s.ReceivePackSuite.EmptyEndpoint = s.prepareRepository(c, fixtures.ByTag("empty").One(), "empty.git")
-	s.ReceivePackSuite.NonExistentEndpoint = s.newEndpoint(c, "non-existent.git")
+	basicFS := prepareRepo(s.T(), fixtures.Basic().One(), base, "basic.git")
+	emptyFS := prepareRepo(s.T(), fixtures.ByTag("empty").One(), base, "empty.git")
+
+	s.Endpoint = httpEndpoint(addr, "basic.git")
+	s.EmptyEndpoint = httpEndpoint(addr, "empty.git")
+	s.NonExistentEndpoint = httpEndpoint(addr, "non-existent.git")
+
+	s.Storer = filesystem.NewStorage(basicFS, nil)
+	s.EmptyStorer = filesystem.NewStorage(emptyFS, nil)
+	s.NonExistentStorer = memory.NewStorage()
+
+	s.Transport = NewTransport(Options{})
 }

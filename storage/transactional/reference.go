@@ -1,9 +1,9 @@
 package transactional
 
 import (
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/storage"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage"
 )
 
 // ReferenceStorage implements the storer.ReferenceStorage for the transactional package.
@@ -15,9 +15,6 @@ type ReferenceStorage struct {
 	// commit is requested, the entries are added when RemoveReference is called
 	// and deleted if SetReference is called.
 	deleted map[plumbing.ReferenceName]struct{}
-	// packRefs if true PackRefs is going to be called in the based storer when
-	// commit is called.
-	packRefs bool
 }
 
 // NewReferenceStorage returns a new ReferenceStorer based on a base storer and
@@ -37,7 +34,7 @@ func (r *ReferenceStorage) SetReference(ref *plumbing.Reference) error {
 	return r.temporal.SetReference(ref)
 }
 
-// SetReference honors the storer.ReferenceStorer interface.
+// CheckAndSetReference honors the storer.ReferenceStorer interface.
 func (r *ReferenceStorage) CheckAndSetReference(ref, old *plumbing.Reference) error {
 	if old == nil {
 		return r.SetReference(ref)
@@ -108,7 +105,6 @@ func (r ReferenceStorage) CountLooseRefs() (int, error) {
 
 // PackRefs honors the storer.ReferenceStorer interface.
 func (r ReferenceStorage) PackRefs() error {
-	r.packRefs = true
 	return nil
 }
 

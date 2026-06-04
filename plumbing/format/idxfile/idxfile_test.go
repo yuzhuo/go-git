@@ -2,25 +2,27 @@ package idxfile_test
 
 import (
 	"bytes"
+	"crypto"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
+	"github.com/stretchr/testify/suite"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/plumbing/hash"
 )
 
 func BenchmarkFindOffset(b *testing.B) {
 	idx, err := fixtureIndex()
 	if err != nil {
-		b.Fatalf(err.Error())
+		b.Fatal(err.Error())
 	}
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, h := range fixtureHashes {
 			_, err := idx.FindOffset(h)
 			if err != nil {
@@ -33,10 +35,10 @@ func BenchmarkFindOffset(b *testing.B) {
 func BenchmarkFindCRC32(b *testing.B) {
 	idx, err := fixtureIndex()
 	if err != nil {
-		b.Fatalf(err.Error())
+		b.Fatal(err.Error())
 	}
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, h := range fixtureHashes {
 			_, err := idx.FindCRC32(h)
 			if err != nil {
@@ -49,10 +51,10 @@ func BenchmarkFindCRC32(b *testing.B) {
 func BenchmarkContains(b *testing.B) {
 	idx, err := fixtureIndex()
 	if err != nil {
-		b.Fatalf(err.Error())
+		b.Fatal(err.Error())
 	}
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, h := range fixtureHashes {
 			ok, err := idx.Contains(h)
 			if err != nil {
@@ -69,10 +71,10 @@ func BenchmarkContains(b *testing.B) {
 func BenchmarkEntries(b *testing.B) {
 	idx, err := fixtureIndex()
 	if err != nil {
-		b.Fatalf(err.Error())
+		b.Fatal(err.Error())
 	}
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		iter, err := idx.Entries()
 		if err != nil {
 			b.Fatalf("unexpected error getting entries: %s", err)
@@ -99,34 +101,38 @@ func BenchmarkEntries(b *testing.B) {
 }
 
 type IndexSuite struct {
-	fixtures.Suite
+	suite.Suite
 }
 
-var _ = Suite(&IndexSuite{})
+func TestIndexSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(IndexSuite))
+}
 
-func (s *IndexSuite) TestFindHash(c *C) {
+func (s *IndexSuite) TestFindHash() {
 	idx, err := fixtureIndex()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	for i, pos := range fixtureOffsets {
 		hash, err := idx.FindHash(pos)
-		c.Assert(err, IsNil)
-		c.Assert(hash, Equals, fixtureHashes[i])
+		s.NoError(err)
+		s.Equal(fixtureHashes[i], hash)
 	}
 }
 
-func (s *IndexSuite) TestEntriesByOffset(c *C) {
+func (s *IndexSuite) TestEntriesByOffset() {
 	idx, err := fixtureIndex()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	entries, err := idx.EntriesByOffset()
-	c.Assert(err, IsNil)
+	s.NoError(err)
+	defer entries.Close()
 
 	for _, pos := range fixtureOffsets {
 		e, err := entries.Next()
-		c.Assert(err, IsNil)
+		s.NoError(err)
 
-		c.Assert(e.Offset, Equals, uint64(pos))
+		s.Equal(uint64(pos), e.Offset)
 	}
 }
 
@@ -155,15 +161,67 @@ var fixtureOffsets = []int64{
 }
 
 func fixtureIndex() (*idxfile.MemoryIndex, error) {
-	f := bytes.NewBufferString(fixtureLarge4GB)
+	raw, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewBufferString(fixtureLarge4GB)))
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error decoding fixture: %s", err)
+	}
 
 	idx := new(idxfile.MemoryIndex)
 
-	d := idxfile.NewDecoder(base64.NewDecoder(base64.StdEncoding, f))
-	err := d.Decode(idx)
-	if err != nil {
+	d := idxfile.NewDecoder(idxfile.FromBytes(raw), hash.New(crypto.SHA1))
+	if err := d.Decode(idx); err != nil {
 		return nil, fmt.Errorf("unexpected error decoding index: %s", err)
 	}
 
 	return idx, nil
+}
+
+type MemoryIndexSuite struct {
+	suite.Suite
+}
+
+func TestMemoryIndexSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(MemoryIndexSuite))
+}
+
+func (s *MemoryIndexSuite) TestCloseIsNoOp() {
+	idx := idxfile.NewMemoryIndex(crypto.SHA1.Size())
+	s.NoError(idx.Close())
+	// Calling Close repeatedly is fine.
+	s.NoError(idx.Close())
+}
+
+func (s *MemoryIndexSuite) TestSatisfiesIndexInterface() {
+	// Close must be reachable via the interface.
+	var idx idxfile.Index = idxfile.NewMemoryIndex(crypto.SHA1.Size())
+	s.NoError(idx.Close())
+}
+
+func TestOffsetHashConcurrentPopulation(t *testing.T) {
+	t.Parallel()
+	idx, err := fixtureIndex()
+	if err != nil {
+		t.Fatalf("failed to build fixture index: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	for _, h := range fixtureHashes {
+		wg.Go(func() {
+			for range 5000 {
+				_, _ = idx.FindOffset(h)
+			}
+		})
+	}
+
+	for _, off := range fixtureOffsets {
+		wg.Go(func() {
+			for range 3000 {
+				_, _ = idx.FindHash(off)
+			}
+		})
+	}
+
+	wg.Wait()
 }

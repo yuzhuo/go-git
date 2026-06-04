@@ -3,9 +3,9 @@ package object
 import (
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 // Blob is used to store arbitrary data - it is generally a file.
@@ -28,7 +28,7 @@ func GetBlob(s storer.EncodedObjectStorer, h plumbing.Hash) (*Blob, error) {
 	return DecodeBlob(o)
 }
 
-// DecodeObject decodes an encoded object into a *Blob.
+// DecodeBlob decodes an encoded object into a *Blob.
 func DecodeBlob(o plumbing.EncodedObject) (*Blob, error) {
 	b := &Blob{}
 	if err := b.Decode(o); err != nil {
@@ -84,7 +84,7 @@ func (b *Blob) Encode(o plumbing.EncodedObject) (err error) {
 
 	defer ioutil.CheckClose(r, &err)
 
-	_, err = io.Copy(w, r)
+	_, err = ioutil.CopyBufferPool(w, r)
 	return err
 }
 

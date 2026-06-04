@@ -1,62 +1,69 @@
 package plumbing
 
 import (
-	"bytes"
-	"crypto/sha1"
+	"crypto"
 	"encoding/hex"
 	"hash"
 	"sort"
 	"strconv"
+
+	format "github.com/go-git/go-git/v6/plumbing/format/config"
 )
 
 // Hash SHA1 hashed content
-type Hash [20]byte
+type Hash = ObjectID
 
-// ZeroHash is Hash with value zero
-var ZeroHash Hash
+// ZeroHash is an ObjectID with value zero.
+var ZeroHash ObjectID
 
-// ComputeHash compute the hash for a given ObjectType and content
-func ComputeHash(t ObjectType, content []byte) Hash {
-	h := NewHasher(t, int64(len(content)))
-	h.Write(content)
-	return h.Sum()
-}
-
-// NewHash return a new Hash from a hexadecimal hash representation
+// NewHash return a new Hash based on a hexadecimal hash representation.
+// Invalid input results into an empty hash.
+//
+// deprecated: Use the new FromHex instead.
 func NewHash(s string) Hash {
-	b, _ := hex.DecodeString(s)
-
-	var h Hash
-	copy(h[:], b)
-
+	h, _ := FromHex(s)
 	return h
 }
 
-func (h Hash) IsZero() bool {
-	var empty Hash
-	return h == empty
-}
-
-func (h Hash) String() string {
-	return hex.EncodeToString(h[:])
-}
-
+// Hasher wraps a hash.Hash to compute git object hashes.
 type Hasher struct {
 	hash.Hash
+	format format.ObjectFormat
 }
 
-func NewHasher(t ObjectType, size int64) Hasher {
-	h := Hasher{sha1.New()}
+// NewHasher returns a new Hasher for the given object format, type and size.
+func NewHasher(f format.ObjectFormat, t ObjectType, size int64) Hasher {
+	h := Hasher{format: f}
+	switch f {
+	case format.SHA256:
+		h.Hash = crypto.SHA256.New()
+	default:
+		// Use SHA1 by default
+		// TODO: return error when format is not supported
+		h.Hash = crypto.SHA1.New()
+	}
+	h.Reset(t, size)
+	return h
+}
+
+// Reset resets the hasher with a new object type and size.
+func (h Hasher) Reset(t ObjectType, size int64) {
+	h.Hash.Reset()
 	h.Write(t.Bytes())
 	h.Write([]byte(" "))
 	h.Write([]byte(strconv.FormatInt(size, 10)))
 	h.Write([]byte{0})
-	return h
 }
 
+// Sum returns the computed hash.
 func (h Hasher) Sum() (hash Hash) {
-	copy(hash[:], h.Hash.Sum(nil))
-	return
+	if h.format == format.SHA256 {
+		hash.format = h.format
+	} else {
+		hash.format = format.UnsetObjectFormat
+	}
+	_, _ = hash.Write(h.Hash.Sum(nil))
+	return hash
 }
 
 // HashesSort sorts a slice of Hashes in increasing order.
@@ -69,15 +76,16 @@ func HashesSort(a []Hash) {
 type HashSlice []Hash
 
 func (p HashSlice) Len() int           { return len(p) }
-func (p HashSlice) Less(i, j int) bool { return bytes.Compare(p[i][:], p[j][:]) < 0 }
+func (p HashSlice) Less(i, j int) bool { return p[i].Compare(p[j].Bytes()) < 0 }
 func (p HashSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
 // IsHash returns true if the given string is a valid hash.
 func IsHash(s string) bool {
-	if len(s) != 40 {
+	switch len(s) {
+	case format.SHA1HexSize, format.SHA256HexSize:
+		_, err := hex.DecodeString(s)
+		return err == nil
+	default:
 		return false
 	}
-
-	_, err := hex.DecodeString(s)
-	return err == nil
 }

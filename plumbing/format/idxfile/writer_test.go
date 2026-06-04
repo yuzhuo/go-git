@@ -2,79 +2,85 @@ package idxfile_test
 
 import (
 	"bytes"
+	"crypto"
 	"encoding/base64"
-	"io/ioutil"
+	"io"
+	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
-	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/suite"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/plumbing/hash"
 )
 
 type WriterSuite struct {
-	fixtures.Suite
+	suite.Suite
 }
 
-var _ = Suite(&WriterSuite{})
+func TestWriterSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(WriterSuite))
+}
 
-func (s *WriterSuite) TestWriter(c *C) {
+func (s *WriterSuite) TestWriter() {
 	f := fixtures.Basic().One()
-	scanner := packfile.NewScanner(f.Packfile())
+	pf, err := f.Packfile()
+	s.Require().NoError(err)
+	scanner := packfile.NewScanner(pf)
 
 	obs := new(idxfile.Writer)
-	parser, err := packfile.NewParser(scanner, obs)
-	c.Assert(err, IsNil)
+	parser := packfile.NewParser(scanner, packfile.WithScannerObservers(obs))
 
 	_, err = parser.Parse()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	idx, err := obs.Index()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
-	idxFile := f.Idx()
-	expected, err := ioutil.ReadAll(idxFile)
-	c.Assert(err, IsNil)
+	idxFile, err := f.Idx()
+	s.Require().NoError(err)
+	expected, err := io.ReadAll(idxFile)
+	s.NoError(err)
 	idxFile.Close()
 
 	buf := new(bytes.Buffer)
-	encoder := idxfile.NewEncoder(buf)
-	n, err := encoder.Encode(idx)
-	c.Assert(err, IsNil)
-	c.Assert(n, Equals, len(expected))
+	err = idxfile.Encode(buf, hash.New(crypto.SHA1), idx)
+	s.NoError(err)
+	s.Len(expected, buf.Len())
 
-	c.Assert(buf.Bytes(), DeepEquals, expected)
+	s.Equal(expected, buf.Bytes())
 }
 
-func (s *WriterSuite) TestWriterLarge(c *C) {
+func (s *WriterSuite) TestWriterLarge() {
 	writer := new(idxfile.Writer)
 	err := writer.OnHeader(uint32(len(fixture4GbEntries)))
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	for _, o := range fixture4GbEntries {
 		err = writer.OnInflatedObjectContent(plumbing.NewHash(o.hash), o.offset, o.crc, nil)
-		c.Assert(err, IsNil)
+		s.NoError(err)
 	}
 
 	err = writer.OnFooter(fixture4GbChecksum)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	idx, err := writer.Index()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	// load fixture index
 	f := bytes.NewBufferString(fixtureLarge4GB)
-	expected, err := ioutil.ReadAll(base64.NewDecoder(base64.StdEncoding, f))
-	c.Assert(err, IsNil)
+	expected, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, f))
+	s.NoError(err)
 
 	buf := new(bytes.Buffer)
-	encoder := idxfile.NewEncoder(buf)
-	n, err := encoder.Encode(idx)
-	c.Assert(err, IsNil)
-	c.Assert(n, Equals, len(expected))
+	err = idxfile.Encode(buf, hash.New(crypto.SHA1), idx)
+	s.NoError(err)
+	s.Len(expected, buf.Len())
 
-	c.Assert(buf.Bytes(), DeepEquals, expected)
+	s.Equal(expected, buf.Bytes())
 }
 
 var (

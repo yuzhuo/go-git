@@ -2,10 +2,14 @@ package gitattributes
 
 import (
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 
-	"github.com/go-git/go-billy/v5"
-	"github.com/go-git/go-git/v5/plumbing/format/config"
-	gioutil "github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-billy/v6"
+
+	"github.com/go-git/go-git/v6/plumbing/format/config"
+	gioutil "github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 const (
@@ -17,6 +21,7 @@ const (
 	systemFile        = "/etc/gitconfig"
 )
 
+// ReadAttributesFile reads a gitattributes file from the given filesystem and path.
 func ReadAttributesFile(fs billy.Filesystem, path []string, attributesFile string, allowMacro bool) ([]MatchAttribute, error) {
 	f, err := fs.Open(fs.Join(append(path, attributesFile)...))
 	if os.IsNotExist(err) {
@@ -25,6 +30,8 @@ func ReadAttributesFile(fs billy.Filesystem, path []string, attributesFile strin
 	if err != nil {
 		return nil, err
 	}
+
+	defer gioutil.CheckClose(f, &err)
 
 	return ReadAttributes(f, path, allowMacro)
 }
@@ -38,7 +45,7 @@ func ReadAttributesFile(fs billy.Filesystem, path []string, attributesFile strin
 func ReadPatterns(fs billy.Filesystem, path []string) (attributes []MatchAttribute, err error) {
 	attributes, err = ReadAttributesFile(fs, path, gitattributesFile, true)
 	if err != nil {
-		return
+		return attributes, err
 	}
 
 	attrs, err := walkDirectory(fs, path)
@@ -56,7 +63,14 @@ func walkDirectory(fs billy.Filesystem, root []string) (attributes []MatchAttrib
 			continue
 		}
 
-		path := append(root, fi.Name())
+		p := fi.Name()
+
+		// Handles the case whereby just the volume name ("C:") is appended,
+		// to root. Change it to "C:\", which is better handled by fs.Join().
+		if filepath.VolumeName(p) != "" && !strings.HasSuffix(p, string(filepath.Separator)) {
+			p += string(filepath.Separator)
+		}
+		path := slices.Concat(root, []string{p})
 
 		dirAttributes, err := ReadAttributesFile(fs, path, gitattributesFile, false)
 		if err != nil {
@@ -71,7 +85,7 @@ func walkDirectory(fs billy.Filesystem, root []string) (attributes []MatchAttrib
 		attributes = append(attributes, append(dirAttributes, subAttributes...)...)
 	}
 
-	return
+	return attributes, err
 }
 
 func loadPatterns(fs billy.Filesystem, path string) ([]MatchAttribute, error) {
@@ -107,7 +121,7 @@ func loadPatterns(fs billy.Filesystem, path string) ([]MatchAttribute, error) {
 func LoadGlobalPatterns(fs billy.Filesystem) (attributes []MatchAttribute, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return
+		return attributes, err
 	}
 
 	return loadPatterns(fs, fs.Join(home, gitconfigFile))

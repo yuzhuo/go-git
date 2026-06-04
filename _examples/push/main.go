@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
 )
 
 // Example of how to open a repository in a specific path, and push to
@@ -15,6 +15,7 @@ func main() {
 
 	r, err := git.PlainOpen(path)
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	Info("git push")
 	// push using default options

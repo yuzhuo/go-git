@@ -1,10 +1,12 @@
 package object
 
 import (
+	"errors"
 	"io"
+	"slices"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 type commitPathIter struct {
@@ -57,6 +59,8 @@ func (c *commitPathIter) Next() (*Commit, error) {
 }
 
 func (c *commitPathIter) getNextFileCommit() (*Commit, error) {
+	var parentTree, currentTree *Tree
+
 	for {
 		// Parent-commit can be nil if the current-commit is the initial commit
 		parentCommit, parentCommitErr := c.sourceIter.Next()
@@ -68,13 +72,17 @@ func (c *commitPathIter) getNextFileCommit() (*Commit, error) {
 			parentCommit = nil
 		}
 
-		// Fetch the trees of the current and parent commits
-		currentTree, currTreeErr := c.currentCommit.Tree()
-		if currTreeErr != nil {
-			return nil, currTreeErr
+		if parentTree == nil {
+			var currTreeErr error
+			currentTree, currTreeErr = c.currentCommit.Tree()
+			if currTreeErr != nil {
+				return nil, currTreeErr
+			}
+		} else {
+			currentTree = parentTree
+			parentTree = nil
 		}
 
-		var parentTree *Tree
 		if parentCommit != nil {
 			var parentTreeErr error
 			parentTree, parentTreeErr = parentCommit.Tree()
@@ -115,7 +123,8 @@ func (c *commitPathIter) hasFileChange(changes Changes, parent *Commit) bool {
 
 		// filename matches, now check if source iterator contains all commits (from all refs)
 		if c.checkParent {
-			if parent != nil && isParentHash(parent.Hash, c.currentCommit) {
+			// Check if parent is beyond the initial commit
+			if parent == nil || isParentHash(parent.Hash, c.currentCommit) {
 				return true
 			}
 			continue
@@ -128,12 +137,7 @@ func (c *commitPathIter) hasFileChange(changes Changes, parent *Commit) bool {
 }
 
 func isParentHash(hash plumbing.Hash, commit *Commit) bool {
-	for _, h := range commit.ParentHashes {
-		if h == hash {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(commit.ParentHashes, hash)
 }
 
 func (c *commitPathIter) ForEach(cb func(*Commit) error) error {
@@ -146,7 +150,7 @@ func (c *commitPathIter) ForEach(cb func(*Commit) error) error {
 			return nextErr
 		}
 		err := cb(commit)
-		if err == storer.ErrStop {
+		if errors.Is(err, storer.ErrStop) {
 			return nil
 		} else if err != nil {
 			return err

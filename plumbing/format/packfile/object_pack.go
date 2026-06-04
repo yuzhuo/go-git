@@ -1,16 +1,16 @@
 package packfile
 
 import (
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // ObjectToPack is a representation of an object that is going to be into a
 // pack file.
 type ObjectToPack struct {
-	// The main object to pack, it could be any object, including deltas
+	// The main object to pack, it could be any object, including deltas.
 	Object plumbing.EncodedObject
-	// Base is the object that a delta is based on (it could be also another delta).
-	// If the main object is not a delta, Base will be null
+	// Base is the object that a delta is based on, which could also be another delta.
+	// Nil when the main object is not a delta.
 	Base *ObjectToPack
 	// Original is the object that we can generate applying the delta to
 	// Base, or the same object as Object in the case of a non-delta
@@ -99,6 +99,7 @@ func (o *ObjectToPack) CleanOriginal() {
 	o.Original = nil
 }
 
+// Type returns the object type.
 func (o *ObjectToPack) Type() plumbing.ObjectType {
 	if o.Original != nil {
 		return o.Original.Type()
@@ -119,6 +120,7 @@ func (o *ObjectToPack) Type() plumbing.ObjectType {
 	panic("cannot get type")
 }
 
+// Hash returns the object hash.
 func (o *ObjectToPack) Hash() plumbing.Hash {
 	if o.Original != nil {
 		return o.Original.Hash()
@@ -136,6 +138,7 @@ func (o *ObjectToPack) Hash() plumbing.Hash {
 	panic("cannot get hash")
 }
 
+// Size returns the object size.
 func (o *ObjectToPack) Size() int64 {
 	if o.Original != nil {
 		return o.Original.Size()
@@ -153,10 +156,12 @@ func (o *ObjectToPack) Size() int64 {
 	panic("cannot get ObjectToPack size")
 }
 
+// IsDelta returns true if the object is a delta.
 func (o *ObjectToPack) IsDelta() bool {
 	return o.Base != nil
 }
 
+// SetDelta sets the object's base and delta.
 func (o *ObjectToPack) SetDelta(base *ObjectToPack, delta plumbing.EncodedObject) {
 	o.Object = delta
 	o.Base = base

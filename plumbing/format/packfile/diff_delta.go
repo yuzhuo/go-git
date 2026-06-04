@@ -3,8 +3,10 @@ package packfile
 import (
 	"bytes"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-git/v6/plumbing"
+	packutil "github.com/go-git/go-git/v6/plumbing/format/packfile/util"
+	"github.com/go-git/go-git/v6/utils/ioutil"
+	"github.com/go-git/go-git/v6/utils/sync"
 )
 
 // See https://github.com/jelmer/dulwich/blob/master/dulwich/pack.py and
@@ -16,7 +18,7 @@ const (
 	s = 16
 
 	// https://github.com/git/git/blob/f7466e94375b3be27f229c78873f0acf8301c0a5/diff-delta.c#L428
-	// Max size of a copy operation (64KB)
+	// Max size of a copy operation (64KB).
 	maxCopySize = 64 * 1024
 )
 
@@ -43,18 +45,16 @@ func getDelta(index *deltaIndex, base, target plumbing.EncodedObject) (o plumbin
 
 	defer ioutil.CheckClose(tr, &err)
 
-	bb := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(bb)
-	bb.Reset()
+	bb := sync.GetBytesBuffer()
+	defer sync.PutBytesBuffer(bb)
 
 	_, err = bb.ReadFrom(br)
 	if err != nil {
 		return nil, err
 	}
 
-	tb := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(tb)
-	tb.Reset()
+	tb := sync.GetBytesBuffer()
+	defer sync.PutBytesBuffer(tb)
 
 	_, err = tb.ReadFrom(tr)
 	if err != nil {
@@ -79,40 +79,39 @@ func DiffDelta(src, tgt []byte) []byte {
 	return diffDelta(new(deltaIndex), src, tgt)
 }
 
-func diffDelta(index *deltaIndex, src []byte, tgt []byte) []byte {
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	buf.Write(deltaEncodeSize(len(src)))
-	buf.Write(deltaEncodeSize(len(tgt)))
+func diffDelta(index *deltaIndex, src, tgt []byte) []byte {
+	buf := sync.GetBytesBuffer()
+	defer sync.PutBytesBuffer(buf)
+	buf.Write(packutil.EncodeLEB128(uint(len(src))))
+	buf.Write(packutil.EncodeLEB128(uint(len(tgt))))
 
 	if len(index.entries) == 0 {
 		index.init(src)
 	}
 
-	ibuf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(ibuf)
-	ibuf.Reset()
+	ibuf := sync.GetBytesBuffer()
+	defer sync.PutBytesBuffer(ibuf)
 	for i := 0; i < len(tgt); i++ {
 		offset, l := index.findMatch(src, tgt, i)
 
-		if l == 0 {
+		switch {
+		case l == 0:
 			// couldn't find a match, just write the current byte and continue
 			ibuf.WriteByte(tgt[i])
-		} else if l < 0 {
+		case l < 0:
 			// src is less than blksz, copy the rest of the target to avoid
 			// calls to findMatch
 			for ; i < len(tgt); i++ {
 				ibuf.WriteByte(tgt[i])
 			}
-		} else if l < s {
+		case l < s:
 			// remaining target is less than blksz, copy what's left of it
 			// and avoid calls to findMatch
 			for j := i; j < i+l; j++ {
 				ibuf.WriteByte(tgt[j])
 			}
 			i += l - 1
-		} else {
+		default:
 			encodeInsertOperation(ibuf, buf)
 
 			rl := l
@@ -146,10 +145,7 @@ func encodeInsertOperation(ibuf, buf *bytes.Buffer) {
 	b := ibuf.Bytes()
 	s := ibuf.Len()
 	o := 0
-	for {
-		if s <= 127 {
-			break
-		}
+	for s > 127 {
 		buf.WriteByte(byte(127))
 		buf.Write(b[o : o+127])
 		s -= 127
@@ -159,24 +155,6 @@ func encodeInsertOperation(ibuf, buf *bytes.Buffer) {
 	buf.Write(b[o : o+s])
 
 	ibuf.Reset()
-}
-
-func deltaEncodeSize(size int) []byte {
-	var ret []byte
-	c := size & 0x7f
-	size >>= 7
-	for {
-		if size == 0 {
-			break
-		}
-
-		ret = append(ret, byte(c|0x80))
-		c = size & 0x7f
-		size >>= 7
-	}
-	ret = append(ret, byte(c))
-
-	return ret
 }
 
 func encodeCopyOperation(offset, length int) []byte {
@@ -192,7 +170,7 @@ func encodeCopyOperation(offset, length int) []byte {
 		}
 	}
 
-	for i = 0; i < 3; i++ {
+	for i = range 3 {
 		f := 0xff << (i * 8)
 		if length&f != 0 {
 			opcodes = append(opcodes, byte(length&f>>(i*8)))

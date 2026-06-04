@@ -1,135 +1,410 @@
 package packfile_test
 
 import (
+	"bytes"
+	"compress/zlib"
+	"crypto/sha1"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"testing"
 
-	"github.com/go-git/go-billy/v5/osfs"
-	"github.com/go-git/go-billy/v5/util"
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/packfile"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	. "gopkg.in/check.v1"
+	billy "github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/osfs"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/internal/fixtureutil"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	packutil "github.com/go-git/go-git/v6/plumbing/format/packfile/util"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/memory"
+	gogitbinary "github.com/go-git/go-git/v6/utils/binary"
 )
 
-type ParserSuite struct {
-	fixtures.Suite
+func TestParserHashes(t *testing.T) {
+	t.Parallel()
+
+	packs := fixtures.ByTag("packfile-entries")
+	require.GreaterOrEqual(t, len(packs), 2)
+
+	packs.Run(t, func(t *testing.T, f *fixtures.Fixture) {
+		t.Parallel()
+
+		entries := fixtureutil.Entries(f)
+		assertParserOutput(t, f, entries)
+	})
 }
 
-var _ = Suite(&ParserSuite{})
+func TestParserStorageModes(t *testing.T) {
+	t.Parallel()
 
-func (s *ParserSuite) TestParserHashes(c *C) {
-	f := fixtures.Basic().One()
-	scanner := packfile.NewScanner(f.Packfile())
+	// TODO: extend to SHA256 once the parser's low-memory path supports it.
+	packs := fixtures.ByTag("packfile-entries").ByObjectFormat("sha1")
+	require.GreaterOrEqual(t, len(packs), 2)
+
+	packs.Run(t, func(t *testing.T, f *fixtures.Fixture) {
+		t.Parallel()
+
+		entries := fixtureutil.Entries(f)
+
+		tests := []struct {
+			name              string
+			storage           storer.Storer
+			option            packfile.ParserOption
+			wantLowMemoryMode bool
+		}{
+			{
+				name:              "with filesystem storage",
+				storage:           filesystem.NewStorage(osfs.New(t.TempDir()), cache.NewObjectLRUDefault()),
+				wantLowMemoryMode: true,
+			},
+			{
+				name:    "with storage and high memory mode",
+				storage: filesystem.NewStorageWithOptions(osfs.New(t.TempDir()), cache.NewObjectLRUDefault(), filesystem.Options{HighMemoryMode: true}),
+			},
+			{
+				name:    "with memory storage",
+				storage: memory.NewStorage(),
+			},
+			{
+				name:   "with memory storage and high memory mode",
+				option: packfile.WithHighMemoryMode(),
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				if closer, ok := tc.storage.(io.Closer); ok {
+					defer func() { _ = closer.Close() }()
+				}
+
+				obs := new(testObserver)
+				pf, pfErr := f.Packfile()
+				require.NoError(t, pfErr)
+
+				opts := []packfile.ParserOption{
+					packfile.WithScannerObservers(obs),
+					packfile.WithStorage(tc.storage),
+				}
+				if f.ObjectFormat == "sha256" {
+					opts = append(opts, packfile.WithObjectFormat(config.SHA256))
+				}
+				if tc.option != nil {
+					opts = append(opts, tc.option)
+				}
+
+				parser := packfile.NewParser(pf, opts...)
+
+				field := reflect.ValueOf(parser).Elem().FieldByName("lowMemoryMode")
+				assert.Equal(t, tc.wantLowMemoryMode, field.Bool())
+
+				_, err := parser.Parse()
+				require.NoError(t, err)
+
+				assert.Equal(t, f.PackfileHash, obs.checksum)
+				assert.Len(t, obs.objects, len(entries))
+
+				for _, obj := range obs.objects {
+					h := plumbing.NewHash(obj.hash)
+					offset, ok := entries[h]
+					assert.True(t, ok, "unexpected object %s", obj.hash)
+					assert.Equal(t, offset, obj.offset, "offset mismatch for %s", obj.hash)
+				}
+			})
+		}
+	})
+}
+
+func assertParserOutput(t *testing.T, f *fixtures.Fixture, entries map[plumbing.Hash]int64) {
+	t.Helper()
 
 	obs := new(testObserver)
-	parser, err := packfile.NewParser(scanner, obs)
-	c.Assert(err, IsNil)
+	pf, pfErr := f.Packfile()
+	require.NoError(t, pfErr)
 
-	ch, err := parser.Parse()
-	c.Assert(err, IsNil)
-
-	checksum := "a3fed42da1e8189a077c0e6846c040dcf73fc9dd"
-	c.Assert(ch.String(), Equals, checksum)
-
-	c.Assert(obs.checksum, Equals, checksum)
-	c.Assert(int(obs.count), Equals, int(31))
-
-	commit := plumbing.CommitObject
-	blob := plumbing.BlobObject
-	tree := plumbing.TreeObject
-
-	objs := []observerObject{
-		{"e8d3ffab552895c19b9fcf7aa264d277cde33881", commit, 254, 12, 0xaa07ba4b},
-		{"6ecf0ef2c2dffb796033e5a02219af86ec6584e5", commit, 245, 186, 0xf706df58},
-		{"918c48b83bd081e863dbe1b80f8998f058cd8294", commit, 242, 286, 0x12438846},
-		{"af2d6a6954d532f8ffb47615169c8fdf9d383a1a", commit, 242, 449, 0x2905a38c},
-		{"1669dce138d9b841a518c64b10914d88f5e488ea", commit, 333, 615, 0xd9429436},
-		{"a5b8b09e2f8fcb0bb99d3ccb0958157b40890d69", commit, 332, 838, 0xbecfde4e},
-		{"35e85108805c84807bc66a02d91535e1e24b38b9", commit, 244, 1063, 0x780e4b3e},
-		{"b8e471f58bcbca63b07bda20e428190409c2db47", commit, 243, 1230, 0xdc18344f},
-		{"b029517f6300c2da0f4b651b8642506cd6aaf45d", commit, 187, 1392, 0xcf4e4280},
-		{"32858aad3c383ed1ff0a0f9bdf231d54a00c9e88", blob, 189, 1524, 0x1f08118a},
-		{"d3ff53e0564a9f87d8e84b6e28e5060e517008aa", blob, 18, 1685, 0xafded7b8},
-		{"c192bd6a24ea1ab01d78686e417c8bdc7c3d197f", blob, 1072, 1713, 0xcc1428ed},
-		{"d5c0f4ab811897cadf03aec358ae60d21f91c50d", blob, 76110, 2351, 0x1631d22f},
-		{"880cd14280f4b9b6ed3986d6671f907d7cc2a198", blob, 2780, 78050, 0xbfff5850},
-		{"49c6bb89b17060d7b4deacb7b338fcc6ea2352a9", blob, 217848, 78882, 0xd108e1d8},
-		{"c8f1d8c61f9da76f4cb49fd86322b6e685dba956", blob, 706, 80725, 0x8e97ba25},
-		{"9a48f23120e880dfbe41f7c9b7b708e9ee62a492", blob, 11488, 80998, 0x7316ff70},
-		{"9dea2395f5403188298c1dabe8bdafe562c491e3", blob, 78, 84032, 0xdb4fce56},
-		{"dbd3641b371024f44d0e469a9c8f5457b0660de1", tree, 272, 84115, 0x901cce2c},
-		{"a8d315b2b1c615d43042c3a62402b8a54288cf5c", tree, 271, 84375, 0xec4552b0},
-		{"a39771a7651f97faf5c72e08224d857fc35133db", tree, 38, 84430, 0x847905bf},
-		{"5a877e6a906a2743ad6e45d99c1793642aaf8eda", tree, 75, 84479, 0x3689459a},
-		{"586af567d0bb5e771e49bdd9434f5e0fb76d25fa", tree, 38, 84559, 0xe67af94a},
-		{"cf4aa3b38974fb7d81f367c0830f7d78d65ab86b", tree, 34, 84608, 0xc2314a2e},
-		{"7e59600739c96546163833214c36459e324bad0a", blob, 9, 84653, 0xcd987848},
-		{"fb72698cab7617ac416264415f13224dfd7a165e", tree, 238, 84671, 0x8a853a6d},
-		{"4d081c50e250fa32ea8b1313cf8bb7c2ad7627fd", tree, 179, 84688, 0x70c6518},
-		{"eba74343e2f15d62adedfd8c883ee0262b5c8021", tree, 148, 84708, 0x4f4108e2},
-		{"c2d30fa8ef288618f65f6eed6e168e0d514886f4", tree, 110, 84725, 0xd6fe09e9},
-		{"8dcef98b1d52143e1e2dbc458ffe38f925786bf2", tree, 111, 84741, 0xf07a2804},
-		{"aa9b383c260e1d05fbbf6b30a02914555e20c725", tree, 73, 84760, 0x1d75d6be},
+	opts := []packfile.ParserOption{packfile.WithScannerObservers(obs)}
+	if f.ObjectFormat == "sha256" {
+		opts = append(opts, packfile.WithObjectFormat(config.SHA256))
 	}
 
-	c.Assert(obs.objects, DeepEquals, objs)
+	parser := packfile.NewParser(pf, opts...)
+
+	_, err := parser.Parse()
+	require.NoError(t, err)
+
+	assert.Equal(t, f.PackfileHash, obs.checksum)
+	assert.Len(t, obs.objects, len(entries))
+
+	for _, obj := range obs.objects {
+		h := plumbing.NewHash(obj.hash)
+		offset, ok := entries[h]
+		assert.True(t, ok, "unexpected object %s", obj.hash)
+		assert.Equal(t, offset, obj.offset, "offset mismatch for %s", obj.hash)
+	}
 }
 
-func (s *ParserSuite) TestThinPack(c *C) {
-	fs := osfs.New(os.TempDir())
-	path, err := util.TempDir(fs, "", "")
-	c.Assert(err, IsNil)
+func TestParserMalformedPack(t *testing.T) {
+	t.Parallel()
+	f := fixtures.Basic().One()
+	pf, pfErr := f.Packfile()
+	require.NoError(t, pfErr)
+	parser := packfile.NewParser(io.LimitReader(pf, 300))
 
+	_, err := parser.Parse()
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func TestThinPack(t *testing.T) {
+	t.Parallel()
 	// Initialize an empty repository
-	r, err := git.PlainInit(path, true)
-	c.Assert(err, IsNil)
+	r, err := git.PlainInit(t.TempDir(), true)
+	assert.NoError(t, err)
 
 	// Try to parse a thin pack without having the required objects in the repo to
 	// see if the correct errors are returned
 	thinpack := fixtures.ByTag("thinpack").One()
-	scanner := packfile.NewScanner(thinpack.Packfile())
-	parser, err := packfile.NewParserWithStorage(scanner, r.Storer) // ParserWithStorage writes to the storer all parsed objects!
-	c.Assert(err, IsNil)
+	thinPf, thinPfErr := thinpack.Packfile()
+	require.NoError(t, thinPfErr)
+	parser := packfile.NewParser(thinPf, packfile.WithStorage(r.Storer)) // ParserWithStorage writes to the storer all parsed objects!
 
 	_, err = parser.Parse()
-	c.Assert(err, Equals, plumbing.ErrObjectNotFound)
-
-	path, err = util.TempDir(fs, "", "")
-	c.Assert(err, IsNil)
+	assert.ErrorIs(t, err, packfile.ErrReferenceDeltaNotFound)
 
 	// start over with a clean repo
-	r, err = git.PlainInit(path, true)
-	c.Assert(err, IsNil)
+	_ = r.Close()
+	r, err = git.PlainInit(t.TempDir(), true)
+	assert.NoError(t, err)
+	defer func() { _ = r.Close() }()
 
 	// Now unpack a base packfile into our empty repo:
 	f := fixtures.ByURL("https://github.com/spinnaker/spinnaker.git").One()
 	w, err := r.Storer.(storer.PackfileWriter).PackfileWriter()
-	c.Assert(err, IsNil)
-	_, err = io.Copy(w, f.Packfile())
-	c.Assert(err, IsNil)
-	w.Close()
+	assert.NoError(t, err)
+	fPf, fPfErr := f.Packfile()
+	require.NoError(t, fPfErr)
+	_, err = io.Copy(w, fPf)
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
 
 	// Check that the test object that will come with our thin pack is *not* in the repo
 	_, err = r.Storer.EncodedObject(plumbing.CommitObject, plumbing.NewHash(thinpack.Head))
-	c.Assert(err, Equals, plumbing.ErrObjectNotFound)
+	assert.ErrorIs(t, err, plumbing.ErrObjectNotFound)
 
 	// Now unpack the thin pack:
-	scanner = packfile.NewScanner(thinpack.Packfile())
-	parser, err = packfile.NewParserWithStorage(scanner, r.Storer) // ParserWithStorage writes to the storer all parsed objects!
-	c.Assert(err, IsNil)
+	thinPf2, thinPf2Err := thinpack.Packfile()
+	require.NoError(t, thinPf2Err)
+	parser = packfile.NewParser(thinPf2, packfile.WithStorage(r.Storer)) // ParserWithStorage writes to the storer all parsed objects!
 
 	h, err := parser.Parse()
-	c.Assert(err, IsNil)
-	c.Assert(h, Equals, plumbing.NewHash("1288734cbe0b95892e663221d94b95de1f5d7be8"))
+	assert.NoError(t, err)
+	assert.Equal(t, plumbing.NewHash("1288734cbe0b95892e663221d94b95de1f5d7be8"), h)
 
 	// Check that our test object is now accessible
 	_, err = r.Storer.EncodedObject(plumbing.CommitObject, plumbing.NewHash(thinpack.Head))
-	c.Assert(err, IsNil)
+	assert.NoError(t, err)
+}
 
+func TestResolveExternalRefsInThinPack(t *testing.T) {
+	t.Parallel()
+	extRefsThinPack, err := fixtures.ByTag("codecommit").One().Packfile()
+	require.NoError(t, err)
+
+	parser := packfile.NewParser(extRefsThinPack)
+
+	checksum, err := parser.Parse()
+	assert.NoError(t, err)
+	assert.NotEqual(t, checksum, plumbing.ZeroHash)
+}
+
+func TestResolveExternalRefs(t *testing.T) {
+	t.Parallel()
+	extRefsThinPack, err := fixtures.ByTag("delta-before-base").One().Packfile()
+	require.NoError(t, err)
+
+	parser := packfile.NewParser(extRefsThinPack)
+
+	checksum, err := parser.Parse()
+	assert.NoError(t, err)
+	assert.NotEqual(t, plumbing.ZeroHash, checksum)
+}
+
+func TestMemoryResolveExternalRefs(t *testing.T) {
+	t.Parallel()
+	extRefsThinPack, err := fixtures.ByTag("delta-before-base").One().Packfile()
+	require.NoError(t, err)
+
+	parser := packfile.NewParser(extRefsThinPack, packfile.WithStorage(memory.NewStorage()))
+
+	checksum, err := parser.Parse()
+	assert.NoError(t, err)
+	assert.NotEqual(t, plumbing.ZeroHash, checksum)
+}
+
+func BenchmarkParseBasic(b *testing.B) {
+	for _, format := range []string{"sha1", "sha256"} {
+		packs := fixtures.ByTag("packfile-entries").ByObjectFormat(format)
+		if len(packs) == 0 {
+			continue
+		}
+
+		f := packs.One()
+		pf, err := f.Packfile()
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		var scanOpts []packfile.ScannerOption
+		var parseOpts []packfile.ParserOption
+		if f.ObjectFormat == "sha256" {
+			scanOpts = append(scanOpts, packfile.WithSHA256())
+			parseOpts = append(parseOpts, packfile.WithObjectFormat(config.SHA256))
+		}
+
+		scanner := packfile.NewScanner(pf, scanOpts...)
+		storage := filesystem.NewStorage(osfs.New(b.TempDir()), cache.NewObjectLRUDefault())
+		b.Cleanup(func() {
+			_ = storage.Close()
+		})
+
+		// TODO: storage modes for SHA256 once the parser's low-memory path supports it.
+		if f.ObjectFormat != "sha256" {
+			b.Run(format+"/with_storage", func(b *testing.B) {
+				benchmarkParseBasic(b, pf, scanner, append(parseOpts, packfile.WithStorage(storage))...)
+			})
+			b.Run(format+"/with_memory_storage", func(b *testing.B) {
+				benchmarkParseBasic(b, pf, scanner, append(parseOpts, packfile.WithStorage(memory.NewStorage()))...)
+			})
+		}
+		b.Run(format+"/without_storage", func(b *testing.B) {
+			benchmarkParseBasic(b, pf, scanner, parseOpts...)
+		})
+	}
+}
+
+func benchmarkParseBasic(b *testing.B,
+	f billy.File, scanner *packfile.Scanner,
+	opts ...packfile.ParserOption,
+) {
+	for i := 0; i < b.N; i++ {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			b.Fatal(err)
+		}
+		if err := scanner.Reset(); err != nil {
+			b.Fatal(err)
+		}
+		parser := packfile.NewParser(scanner, opts...)
+
+		checksum, err := parser.Parse()
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if checksum == plumbing.ZeroHash {
+			b.Fatal("failed to parse")
+		}
+	}
+}
+
+func BenchmarkParse(b *testing.B) {
+	for _, f := range fixtures.ByTag("packfile") {
+		pff, pffErr := f.Packfile()
+		if pffErr != nil {
+			b.Fatal(pffErr)
+		}
+		scanner := packfile.NewScanner(pff)
+
+		b.Run(f.URL, func(b *testing.B) {
+			benchmarkParseBasic(b, pff, scanner)
+		})
+	}
+}
+
+// BenchmarkParseAlternatingDeltaChain exercises the depth-first delta walk
+// on packs built from one non-delta base followed by N delta entries that
+// alternate between OFS_DELTA and REF_DELTA, each derived from the
+// previous entry. The fixture-based BenchmarkParse and BenchmarkParseBasic
+// do not contain this shape — they cover pure OFS chains as produced by
+// canonical Git's repacker — so without this target a regression in
+// resolveDeltas would go unnoticed.
+func BenchmarkParseAlternatingDeltaChain(b *testing.B) {
+	for _, chainDepth := range []int{1, 4, 16, 64, 256} {
+		pack := buildAlternatingDeltaChainPack(b, chainDepth)
+		b.Run(fmt.Sprintf("depth=%d", chainDepth), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(pack)))
+			for i := 0; i < b.N; i++ {
+				parser := packfile.NewParser(bytes.NewReader(pack))
+				if _, err := parser.Parse(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// buildAlternatingDeltaChainPack returns a pack with one non-delta base
+// followed by chainDepth deltas. Odd-indexed deltas are OFS_DELTAs whose
+// base is the immediately preceding entry; even-indexed deltas are
+// REF_DELTAs whose base hash is the resolved hash of the preceding entry.
+// This shape exercises every transition (non-delta → OFS, OFS → REF,
+// REF → OFS, REF → REF) the parser's depth-first walk has to handle.
+func buildAlternatingDeltaChainPack(tb testing.TB, chainDepth int) []byte {
+	tb.Helper()
+
+	contents := make([][]byte, chainDepth+1)
+	contents[0] = []byte("benchmark base payload for the alternating delta chain")
+	for i := 1; i <= chainDepth; i++ {
+		next := make([]byte, len(contents[i-1]))
+		copy(next, contents[i-1])
+		next[i%len(next)] ^= 0xff
+		contents[i] = next
+	}
+
+	hashes := make([]plumbing.Hash, chainDepth+1)
+	for i := range contents {
+		hashes[i] = blobHash(contents[i])
+	}
+
+	var pack bytes.Buffer
+	sha := sha1.New()
+	w := io.MultiWriter(&pack, sha)
+
+	_, _ = w.Write([]byte("PACK"))
+	_ = binary.Write(w, binary.BigEndian, uint32(2))
+	_ = binary.Write(w, binary.BigEndian, uint32(chainDepth+1))
+
+	offsets := make([]int64, chainDepth+1)
+
+	// Entry 0: non-delta base blob.
+	offsets[0] = int64(pack.Len())
+	writePackObjectHeader(tb, w, plumbing.BlobObject, int64(len(contents[0])))
+	writeZlibPayload(tb, w, contents[0])
+
+	for i := 1; i <= chainDepth; i++ {
+		offsets[i] = int64(pack.Len())
+		delta := packfile.DiffDelta(contents[i-1], contents[i])
+		if i%2 == 1 {
+			writePackObjectHeader(tb, w, plumbing.OFSDeltaObject, int64(len(delta)))
+			_ = gogitbinary.WriteVariableWidthInt(w, offsets[i]-offsets[i-1])
+		} else {
+			writePackObjectHeader(tb, w, plumbing.REFDeltaObject, int64(len(delta)))
+			_, _ = hashes[i-1].WriteTo(w)
+		}
+		writeZlibPayload(tb, w, delta)
+	}
+
+	_, _ = pack.Write(sha.Sum(nil))
+	return pack.Bytes()
 }
 
 type observerObject struct {
@@ -153,7 +428,7 @@ func (t *testObserver) OnHeader(count uint32) error {
 	return nil
 }
 
-func (t *testObserver) OnInflatedObjectHeader(otype plumbing.ObjectType, objSize int64, pos int64) error {
+func (t *testObserver) OnInflatedObjectHeader(otype plumbing.ObjectType, objSize, pos int64) error {
 	o := t.get(pos)
 	o.otype = otype
 	o.size = objSize
@@ -199,39 +474,262 @@ func (t *testObserver) put(pos int64, o observerObject) {
 	t.objects = append(t.objects, o)
 }
 
-func BenchmarkParse(b *testing.B) {
-	defer fixtures.Clean()
+func TestChecksumMismatch(t *testing.T) {
+	t.Parallel()
 
-	for _, f := range fixtures.ByTag("packfile") {
-		b.Run(f.URL, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				parser, err := packfile.NewParser(packfile.NewScanner(f.Packfile()))
-				if err != nil {
-					b.Fatal(err)
-				}
+	f, err := os.CreateTemp(t.TempDir(), "temp.pack")
+	require.NoError(t, err)
+	defer f.Close()
 
-				_, err = parser.Parse()
-				if err != nil {
-					b.Fatal(err)
-				}
+	basicPf, bpfErr := fixtures.Basic().One().Packfile()
+	require.NoError(t, bpfErr)
+	_, err = io.Copy(f, basicPf)
+	require.NoError(t, err)
+
+	_, err = f.Seek(-1, io.SeekEnd)
+	require.NoError(t, err)
+
+	_, err = f.Write([]byte{0})
+	require.NoError(t, err)
+
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	scanner := packfile.NewScanner(f)
+	parser := packfile.NewParser(scanner)
+
+	_, err = parser.Parse()
+	require.ErrorContains(t, err, "checksum mismatch")
+}
+
+func TestMalformedPack(t *testing.T) {
+	t.Parallel()
+
+	f, err := os.CreateTemp(t.TempDir(), "temp.pack")
+	require.NoError(t, err)
+	defer f.Close()
+
+	basicPf2, bpf2Err := fixtures.Basic().One().Packfile()
+	require.NoError(t, bpf2Err)
+	_, err = io.Copy(f, io.LimitReader(basicPf2, 200))
+	require.NoError(t, err)
+
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	scanner := packfile.NewScanner(f)
+	parser := packfile.NewParser(scanner)
+
+	_, err = parser.Parse()
+	require.ErrorContains(t, err, "malformed pack")
+}
+
+func TestParserRejectsOverflowingObjectHeader(t *testing.T) {
+	t.Parallel()
+
+	// Build a minimal pack whose first (and only) object header advertises
+	// a variable-length size with enough continuation bytes that the
+	// running shift would exceed what a uint64 can hold. The decoder must
+	// reject this as malformed input rather than propagate a value that
+	// later flows into a buffer allocation.
+	var body bytes.Buffer
+	body.WriteString("PACK")
+	_ = binary.Write(&body, binary.BigEndian, uint32(2))
+	_ = binary.Write(&body, binary.BigEndian, uint32(1))
+	body.WriteByte(0x90) // type=commit, continuation=1, low nibble=0
+	body.Write(bytes.Repeat([]byte{0x80}, 9))
+
+	sum := sha1.Sum(body.Bytes())
+	body.Write(sum[:])
+
+	parser := packfile.NewParser(bytes.NewReader(body.Bytes()))
+
+	_, err := parser.Parse()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "malformed pack")
+}
+
+// writePackObjectHeader writes a packfile object header for an entry of
+// the given type and uncompressed payload size in the variable-length
+// encoding used by the pack format (4 bits of size in the first byte, 7
+// bits per continuation byte).
+func writePackObjectHeader(tb testing.TB, w io.Writer, typ plumbing.ObjectType, size int64) {
+	tb.Helper()
+	first := byte(typ)<<4 | byte(size&0x0F)
+	rest := uint(size >> 4)
+	if rest != 0 {
+		first |= 0x80
+	}
+	_, _ = w.Write([]byte{first})
+	if rest != 0 {
+		_ = packutil.EncodeLEB128ToWriter(w, rest)
+	}
+}
+
+// writeZlibPayload zlib-compresses payload and writes the result to w.
+func writeZlibPayload(tb testing.TB, w io.Writer, payload []byte) {
+	tb.Helper()
+	zw := zlib.NewWriter(w)
+	_, _ = zw.Write(payload)
+	_ = zw.Close()
+}
+
+func blobHash(content []byte) plumbing.Hash {
+	hasher := plumbing.NewHasher(config.SHA1, plumbing.BlobObject, int64(len(content)))
+	_, _ = hasher.Write(content)
+	return hasher.Sum()
+}
+
+// TestParserResolvesRefDeltaOfOfsDelta covers a pack containing a chain
+// where a REF_DELTA's base is itself an OFS_DELTA. This shape is legal per
+// the packfile spec and canonical Git's threaded_second_pass
+// (builtin/index-pack.c:1103 in v2.54.0 94f057755b) walks delta children
+// of both kinds depth-first from every non-delta base.
+//
+// A two-pass parser that resolves all REF_DELTAs first and OFS_DELTAs
+// second would look up the REF_DELTA's base hash before the OFS_DELTA has
+// been resolved (its hash is unknown at scan time), silently mark it as a
+// thin-pack external reference, and then fail to materialise the leaf
+// object.
+//
+// The probe runs under every storage mode the parser supports, because
+// the storage-backed paths (parentReader at parser.go:333 and the
+// LowMemoryMode branch in ensureContent) reload a resolved delta's
+// contents through parent.Hash, and the new depth-first walk depends on
+// that hash being set on the just-resolved OFS-delta before any REF-delta
+// children look it up.
+func TestParserResolvesRefDeltaOfOfsDelta(t *testing.T) {
+	t.Parallel()
+
+	pack, midHash, leafHash := buildRefOnOfsDeltaChainPack(t)
+
+	tests := []struct {
+		name    string
+		storage storer.Storer
+		option  packfile.ParserOption
+	}{
+		{
+			name: "no storage",
+		},
+		{
+			name:    "with memory storage",
+			storage: memory.NewStorage(),
+		},
+		{
+			name:   "with memory storage and high memory mode",
+			option: packfile.WithHighMemoryMode(),
+		},
+		{
+			name:    "with filesystem storage",
+			storage: filesystem.NewStorage(osfs.New(t.TempDir()), cache.NewObjectLRUDefault()),
+		},
+		{
+			name:    "with filesystem storage and high memory mode",
+			storage: filesystem.NewStorageWithOptions(osfs.New(t.TempDir()), cache.NewObjectLRUDefault(), filesystem.Options{HighMemoryMode: true}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if closer, ok := tc.storage.(io.Closer); ok {
+				defer func() { _ = closer.Close() }()
 			}
+
+			obs := new(testObserver)
+			opts := []packfile.ParserOption{packfile.WithScannerObservers(obs)}
+			if tc.storage != nil {
+				opts = append(opts, packfile.WithStorage(tc.storage))
+			}
+			if tc.option != nil {
+				opts = append(opts, tc.option)
+			}
+
+			parser := packfile.NewParser(bytes.NewReader(pack), opts...)
+
+			_, err := parser.Parse()
+			require.NoError(t, err, "parser must resolve REF-delta whose base is an in-pack OFS-delta")
+
+			seen := make(map[plumbing.Hash]bool, len(obs.objects))
+			for _, o := range obs.objects {
+				seen[plumbing.NewHash(o.hash)] = true
+			}
+			assert.True(t, seen[midHash], "OFS-delta resolved hash %s missing from observer", midHash)
+			assert.True(t, seen[leafHash], "REF-delta resolved hash %s missing from observer", leafHash)
 		})
 	}
 }
 
-func BenchmarkParseBasic(b *testing.B) {
-	defer fixtures.Clean()
+// buildRefOnOfsDeltaChainPack returns a 3-entry pack with the shape
+// [base blob, OFS-delta(base=blob), REF-delta(base=OFS-delta-hash)], along
+// with the resolved hashes of the two delta entries.
+func buildRefOnOfsDeltaChainPack(t *testing.T) (pack []byte, midHash, leafHash plumbing.Hash) {
+	t.Helper()
 
-	f := fixtures.Basic().One()
-	for i := 0; i < b.N; i++ {
-		parser, err := packfile.NewParser(packfile.NewScanner(f.Packfile()))
-		if err != nil {
-			b.Fatal(err)
-		}
+	base := []byte("a stable base payload used by the OFS-delta entry")
+	mid := []byte("a stable base payload modified by the OFS-delta entry")
+	leaf := []byte("a stable base payload modified twice for the REF-delta")
 
-		_, err = parser.Parse()
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	midHash = blobHash(mid)
+	leafHash = blobHash(leaf)
+
+	var buf bytes.Buffer
+	h := sha1.New()
+	w := io.MultiWriter(&buf, h)
+
+	// PACK header: magic, version 2, 3 entries.
+	_, _ = w.Write([]byte("PACK"))
+	_ = binary.Write(w, binary.BigEndian, uint32(2))
+	_ = binary.Write(w, binary.BigEndian, uint32(3))
+
+	// Entry 1: non-delta base blob at offset 12.
+	obj1Offset := int64(buf.Len())
+	writePackObjectHeader(t, w, plumbing.BlobObject, int64(len(base)))
+	writeZlibPayload(t, w, base)
+
+	// Entry 2: OFS-delta whose base is entry 1.
+	obj2Offset := int64(buf.Len())
+	delta12 := packfile.DiffDelta(base, mid)
+	writePackObjectHeader(t, w, plumbing.OFSDeltaObject, int64(len(delta12)))
+	_ = gogitbinary.WriteVariableWidthInt(w, obj2Offset-obj1Offset)
+	writeZlibPayload(t, w, delta12)
+
+	// Entry 3: REF-delta whose base is entry 2's resolved hash.
+	delta23 := packfile.DiffDelta(mid, leaf)
+	writePackObjectHeader(t, w, plumbing.REFDeltaObject, int64(len(delta23)))
+	_, _ = midHash.WriteTo(w)
+	writeZlibPayload(t, w, delta23)
+
+	// SHA-1 trailer over the pack body.
+	_, _ = buf.Write(h.Sum(nil))
+
+	return buf.Bytes(), midHash, leafHash
+}
+
+// TestParserParseRejectsSecondCall pins the single-shot Parser invariant
+// documented on the Parser type: once Parse has been called (whether it
+// returned successfully or with an error mid-walk), a subsequent call
+// against the same instance must fail loudly rather than silently
+// running over the prior call's leftover state.
+func TestParserParseRejectsSecondCall(t *testing.T) {
+	t.Parallel()
+
+	// Build a minimal valid pack with zero objects (header + count=0 +
+	// SHA-1 trailer over the header). Parse accepts this and returns
+	// the pack checksum; the test then asserts the second call against
+	// the same Parser is rejected.
+	var buf bytes.Buffer
+	h := sha1.New()
+	w := io.MultiWriter(&buf, h)
+	_, _ = w.Write([]byte{'P', 'A', 'C', 'K'})
+	_ = binary.Write(w, binary.BigEndian, uint32(2))
+	_ = binary.Write(w, binary.BigEndian, uint32(0))
+	_, _ = buf.Write(h.Sum(nil))
+
+	p := packfile.NewParser(bytes.NewReader(buf.Bytes()))
+	_, err := p.Parse()
+	require.NoError(t, err, "first Parse on the empty-object pack should succeed")
+
+	_, err = p.Parse()
+	assert.ErrorIs(t, err, packfile.ErrParserConsumed, "second Parse must return ErrParserConsumed")
 }

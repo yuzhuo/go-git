@@ -4,24 +4,19 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/stretchr/testify/assert"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
-type CommonSuite struct{}
-
-var _ = Suite(&CommonSuite{})
-
-func (s *CommonSuite) TestEmptyUpdateObjectStorage(c *C) {
+func TestEmptyUpdateObjectStorage(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	sto := memory.NewStorage()
 
 	err := UpdateObjectStorage(sto, &buf)
-	c.Assert(err, Equals, ErrEmptyPackfile)
+	assert.ErrorIs(t, err, ErrEmptyPackfile)
 }
 
 func newObject(t plumbing.ObjectType, cont []byte) plumbing.EncodedObject {

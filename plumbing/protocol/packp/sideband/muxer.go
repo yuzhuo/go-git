@@ -3,14 +3,14 @@ package sideband
 import (
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 )
 
 // Muxer multiplex the packfile along with the progress messages and the error
 // information. The multiplex is perform using pktline format.
 type Muxer struct {
 	max int
-	e   *pktline.Encoder
+	w   io.Writer
 }
 
 const chLen = 1
@@ -21,14 +21,14 @@ const chLen = 1
 // other value is given, max pack is set to MaxPackedSize64k, that is the
 // maximum length of a line in pktline format.
 func NewMuxer(t Type, w io.Writer) *Muxer {
-	max := MaxPackedSize64k
+	maxSize := MaxPackedSize64k
 	if t == Sideband {
-		max = MaxPackedSize
+		maxSize = MaxPackedSize
 	}
 
 	return &Muxer{
-		max: max - chLen,
-		e:   pktline.NewEncoder(w),
+		max: maxSize - chLen,
+		w:   w,
 	}
 }
 
@@ -56,10 +56,8 @@ func (m *Muxer) WriteChannel(t Channel, p []byte) (int, error) {
 }
 
 func (m *Muxer) doWrite(ch Channel, p []byte) (int, error) {
-	sz := len(p)
-	if sz > m.max {
-		sz = m.max
-	}
+	sz := min(len(p), m.max)
 
-	return sz, m.e.Encode(ch.WithPayload(p[:sz]))
+	_, err := pktline.Write(m.w, ch.WithPayload(p[:sz]))
+	return sz, err
 }

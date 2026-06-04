@@ -2,23 +2,26 @@ package storer
 
 import (
 	"fmt"
+	"io"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
 type ObjectSuite struct {
+	suite.Suite
 	Objects []plumbing.EncodedObject
 	Hash    []plumbing.Hash
 }
 
-var _ = Suite(&ObjectSuite{})
+func TestObjectSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(ObjectSuite))
+}
 
-func (s *ObjectSuite) SetUpSuite(c *C) {
+func (s *ObjectSuite) SetupSuite() {
 	s.Objects = []plumbing.EncodedObject{
 		s.buildObject([]byte("foo")),
 		s.buildObject([]byte("bar")),
@@ -29,7 +32,7 @@ func (s *ObjectSuite) SetUpSuite(c *C) {
 	}
 }
 
-func (s *ObjectSuite) TestMultiObjectIterNext(c *C) {
+func (s *ObjectSuite) TestMultiObjectIterNext() {
 	expected := []plumbing.EncodedObject{
 		&plumbing.MemoryObject{},
 		&plumbing.MemoryObject{},
@@ -47,7 +50,7 @@ func (s *ObjectSuite) TestMultiObjectIterNext(c *C) {
 
 	var i int
 	iter.ForEach(func(o plumbing.EncodedObject) error {
-		c.Assert(o, Equals, expected[i])
+		s.Equal(expected[i], o)
 		i++
 		return nil
 	})
@@ -62,54 +65,54 @@ func (s *ObjectSuite) buildObject(content []byte) plumbing.EncodedObject {
 	return o
 }
 
-func (s *ObjectSuite) TestObjectLookupIter(c *C) {
+func (s *ObjectSuite) TestObjectLookupIter() {
 	var count int
 
 	storage := &MockObjectStorage{s.Objects}
 	i := NewEncodedObjectLookupIter(storage, plumbing.CommitObject, s.Hash)
 	err := i.ForEach(func(o plumbing.EncodedObject) error {
-		c.Assert(o, NotNil)
-		c.Assert(o.Hash().String(), Equals, s.Hash[count].String())
+		s.NotNil(o)
+		s.Equal(s.Hash[count].String(), o.Hash().String())
 		count++
 		return nil
 	})
 
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	i.Close()
 }
 
-func (s *ObjectSuite) TestObjectSliceIter(c *C) {
+func (s *ObjectSuite) TestObjectSliceIter() {
 	var count int
 
 	i := NewEncodedObjectSliceIter(s.Objects)
 	err := i.ForEach(func(o plumbing.EncodedObject) error {
-		c.Assert(o, NotNil)
-		c.Assert(o.Hash().String(), Equals, s.Hash[count].String())
+		s.NotNil(o)
+		s.Equal(s.Hash[count].String(), o.Hash().String())
 		count++
 		return nil
 	})
 
-	c.Assert(count, Equals, 2)
-	c.Assert(err, IsNil)
-	c.Assert(i.series, HasLen, 0)
+	s.Equal(2, count)
+	s.NoError(err)
+	s.Len(i.series, 0)
 }
 
-func (s *ObjectSuite) TestObjectSliceIterStop(c *C) {
+func (s *ObjectSuite) TestObjectSliceIterStop() {
 	i := NewEncodedObjectSliceIter(s.Objects)
 
-	var count = 0
+	count := 0
 	err := i.ForEach(func(o plumbing.EncodedObject) error {
-		c.Assert(o, NotNil)
-		c.Assert(o.Hash().String(), Equals, s.Hash[count].String())
+		s.NotNil(o)
+		s.Equal(s.Hash[count].String(), o.Hash().String())
 		count++
 		return ErrStop
 	})
 
-	c.Assert(count, Equals, 1)
-	c.Assert(err, IsNil)
+	s.Equal(1, count)
+	s.NoError(err)
 }
 
-func (s *ObjectSuite) TestObjectSliceIterError(c *C) {
+func (s *ObjectSuite) TestObjectSliceIterError() {
 	i := NewEncodedObjectSliceIter([]plumbing.EncodedObject{
 		s.buildObject([]byte("foo")),
 	})
@@ -118,18 +121,22 @@ func (s *ObjectSuite) TestObjectSliceIterError(c *C) {
 		return fmt.Errorf("a random error")
 	})
 
-	c.Assert(err, NotNil)
+	s.NotNil(err)
 }
 
 type MockObjectStorage struct {
 	db []plumbing.EncodedObject
 }
 
+func (o *MockObjectStorage) RawObjectWriter(_ plumbing.ObjectType, _ int64) (w io.WriteCloser, err error) {
+	return nil, nil
+}
+
 func (o *MockObjectStorage) NewEncodedObject() plumbing.EncodedObject {
 	return nil
 }
 
-func (o *MockObjectStorage) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.Hash, error) {
+func (o *MockObjectStorage) SetEncodedObject(_ plumbing.EncodedObject) (plumbing.Hash, error) {
 	return plumbing.ZeroHash, nil
 }
 
@@ -143,7 +150,8 @@ func (o *MockObjectStorage) HasEncodedObject(h plumbing.Hash) error {
 }
 
 func (o *MockObjectStorage) EncodedObjectSize(h plumbing.Hash) (
-	size int64, err error) {
+	size int64, err error,
+) {
 	for _, o := range o.db {
 		if o.Hash() == h {
 			return o.Size(), nil
@@ -152,7 +160,7 @@ func (o *MockObjectStorage) EncodedObjectSize(h plumbing.Hash) (
 	return 0, plumbing.ErrObjectNotFound
 }
 
-func (o *MockObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
+func (o *MockObjectStorage) EncodedObject(_ plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
 	for _, o := range o.db {
 		if o.Hash() == h {
 			return o, nil
@@ -161,10 +169,14 @@ func (o *MockObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash
 	return nil, plumbing.ErrObjectNotFound
 }
 
-func (o *MockObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (EncodedObjectIter, error) {
+func (o *MockObjectStorage) IterEncodedObjects(_ plumbing.ObjectType) (EncodedObjectIter, error) {
 	return nil, nil
 }
 
 func (o *MockObjectStorage) Begin() Transaction {
+	return nil
+}
+
+func (o *MockObjectStorage) AddAlternate(_ string) error {
 	return nil
 }

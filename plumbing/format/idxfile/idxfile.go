@@ -1,13 +1,14 @@
 package idxfile
 
 import (
-	"bytes"
+	"crypto"
+	encbin "encoding/binary"
+	"fmt"
 	"io"
 	"sort"
+	"sync"
 
-	encbin "encoding/binary"
-
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 const (
@@ -17,11 +18,17 @@ const (
 	noMapping = -1
 )
 
-var (
-	idxHeader = []byte{255, 't', 'O', 'c'}
-)
+var idxHeader = []byte{255, 't', 'O', 'c'}
 
 // Index represents an index of a packfile.
+//
+// Implementations satisfy a [io.Closer] contract via [Index.Close]:
+// on-disk implementations release file descriptors, pure
+// in-memory implementations return nil. Downstream callers
+// holding their own concrete [Index] implementations must
+// supply a [Close] method to satisfy this interface; a no-op
+// `func (*MyIndex) Close() error { return nil }` is sufficient
+// for in-memory backends.
 type Index interface {
 	// Contains checks whether the given hash is in the index.
 	Contains(h plumbing.Hash) (bool, error)
@@ -39,36 +46,60 @@ type Index interface {
 	// EntriesByOffset returns an iterator to retrieve all index entries ordered
 	// by offset.
 	EntriesByOffset() (EntryIter, error)
+	// Close releases any resources held by the index. Implementations
+	// backed by on-disk files must close their file descriptors; pure
+	// in-memory implementations must return nil. Close is idempotent.
+	Close() error
 }
 
 // MemoryIndex is the in memory representation of an idx file.
+//
+// The use of MemoryIndex for large repositories is discouraged.
+// Use [LazyIndex] instead.
 type MemoryIndex struct {
+	// Version is the version of the index file.
 	Version uint32
-	Fanout  [256]uint32
+	// Fanout is a table where the Nth entry is the cumulative count of objects with the first byte of their name <= N.
+	Fanout [256]uint32
 	// FanoutMapping maps the position in the fanout table to the position
 	// in the Names, Offset32 and CRC32 slices. This improves the memory
 	// usage by not needing an array with unnecessary empty slots.
-	FanoutMapping    [256]int
-	Names            [][]byte
-	Offset32         [][]byte
-	CRC32            [][]byte
-	Offset64         []byte
-	PackfileChecksum [20]byte
-	IdxChecksum      [20]byte
+	FanoutMapping [256]int
+	// Names is the list of object names.
+	Names [][]byte
+	// Offset32 is the list of 32-bit offsets.
+	Offset32 [][]byte
+	// CRC32 is the list of CRC32 checksums.
+	CRC32 [][]byte
+	// Offset64 is the list of 64-bit offsets.
+	Offset64 []byte
+	// PackfileChecksum is the checksum of the packfile.
+	PackfileChecksum plumbing.Hash
+	// IdxChecksum is the checksum of the index file.
+	IdxChecksum plumbing.Hash
 
-	offsetHash       map[int64]plumbing.Hash
-	offsetHashIsFull bool
+	offsetHash      map[int64]plumbing.Hash
+	offsetBuildOnce sync.Once
+	mu              sync.RWMutex
+
+	objectIDSize int
 }
 
 var _ Index = (*MemoryIndex)(nil)
 
+// Close is a no-op. MemoryIndex holds no external resources.
+func (idx *MemoryIndex) Close() error { return nil }
+
 // NewMemoryIndex returns an instance of a new MemoryIndex.
-func NewMemoryIndex() *MemoryIndex {
-	return &MemoryIndex{}
+func NewMemoryIndex(objectIDSize int) *MemoryIndex {
+	m := &MemoryIndex{objectIDSize: objectIDSize}
+	m.IdxChecksum.ResetBySize(objectIDSize)
+	m.PackfileChecksum.ResetBySize(objectIDSize)
+	return m
 }
 
 func (idx *MemoryIndex) findHashIndex(h plumbing.Hash) (int, bool) {
-	k := idx.FanoutMapping[h[0]]
+	k := idx.FanoutMapping[h.Bytes()[0]]
 	if k == noMapping {
 		return 0, false
 	}
@@ -86,14 +117,15 @@ func (idx *MemoryIndex) findHashIndex(h plumbing.Hash) (int, bool) {
 	low := uint64(0)
 	for {
 		mid := (low + high) >> 1
-		offset := mid * objectIDLength
+		offset := mid * uint64(idx.idSize())
 
-		cmp := bytes.Compare(h[:], data[offset:offset+objectIDLength])
-		if cmp < 0 {
+		cmp := h.Compare(data[offset : offset+uint64(idx.idSize())])
+		switch {
+		case cmp < 0:
 			high = mid
-		} else if cmp == 0 {
+		case cmp == 0:
 			return int(mid), true
-		} else {
+		default:
 			low = mid + 1
 		}
 
@@ -113,47 +145,53 @@ func (idx *MemoryIndex) Contains(h plumbing.Hash) (bool, error) {
 
 // FindOffset implements the Index interface.
 func (idx *MemoryIndex) FindOffset(h plumbing.Hash) (int64, error) {
-	if len(idx.FanoutMapping) <= int(h[0]) {
+	fo := h.Bytes()[0]
+	if len(idx.FanoutMapping) <= int(fo) {
 		return 0, plumbing.ErrObjectNotFound
 	}
 
-	k := idx.FanoutMapping[h[0]]
+	k := idx.FanoutMapping[fo]
 	i, ok := idx.findHashIndex(h)
 	if !ok {
 		return 0, plumbing.ErrObjectNotFound
 	}
 
-	offset := idx.getOffset(k, i)
-
-	if !idx.offsetHashIsFull {
-		// Save the offset for reverse lookup
-		if idx.offsetHash == nil {
-			idx.offsetHash = make(map[int64]plumbing.Hash)
-		}
-		idx.offsetHash[int64(offset)] = h
+	offset, err := idx.getOffset(k, i)
+	if err != nil {
+		return 0, err
 	}
+
+	// Save the offset for reverse lookup
+	idx.mu.Lock()
+	if idx.offsetHash == nil {
+		idx.offsetHash = make(map[int64]plumbing.Hash)
+	}
+	idx.offsetHash[int64(offset)] = h
+	idx.mu.Unlock()
 
 	return int64(offset), nil
 }
 
 const isO64Mask = uint64(1) << 31
 
-func (idx *MemoryIndex) getOffset(firstLevel, secondLevel int) uint64 {
+func (idx *MemoryIndex) getOffset(firstLevel, secondLevel int) (uint64, error) {
 	offset := secondLevel << 2
 	ofs := encbin.BigEndian.Uint32(idx.Offset32[firstLevel][offset : offset+4])
 
 	if (uint64(ofs) & isO64Mask) != 0 {
 		offset := 8 * (uint64(ofs) & ^isO64Mask)
-		n := encbin.BigEndian.Uint64(idx.Offset64[offset : offset+8])
-		return n
+		if l := uint64(len(idx.Offset64)); l < 8 || offset > l-8 {
+			return 0, fmt.Errorf("%w: offset64 index out of range", ErrMalformedIdxFile)
+		}
+		return encbin.BigEndian.Uint64(idx.Offset64[offset : offset+8]), nil
 	}
 
-	return uint64(ofs)
+	return uint64(ofs), nil
 }
 
 // FindCRC32 implements the Index interface.
 func (idx *MemoryIndex) FindCRC32(h plumbing.Hash) (uint32, error) {
-	k := idx.FanoutMapping[h[0]]
+	k := idx.FanoutMapping[h.Bytes()[0]]
 	i, ok := idx.findHashIndex(h)
 	if !ok {
 		return 0, plumbing.ErrObjectNotFound
@@ -172,20 +210,26 @@ func (idx *MemoryIndex) FindHash(o int64) (plumbing.Hash, error) {
 	var hash plumbing.Hash
 	var ok bool
 
+	idx.mu.RLock()
 	if idx.offsetHash != nil {
 		if hash, ok = idx.offsetHash[o]; ok {
+			idx.mu.RUnlock()
 			return hash, nil
 		}
 	}
+	idx.mu.RUnlock()
 
-	// Lazily generate the reverse offset/hash map if required.
-	if !idx.offsetHashIsFull || idx.offsetHash == nil {
-		if err := idx.genOffsetHash(); err != nil {
-			return plumbing.ZeroHash, err
-		}
-
-		hash, ok = idx.offsetHash[o]
+	var genErr error
+	idx.offsetBuildOnce.Do(func() {
+		genErr = idx.genOffsetHash()
+	})
+	if genErr != nil {
+		return plumbing.ZeroHash, genErr
 	}
+
+	idx.mu.RLock()
+	hash, ok = idx.offsetHash[o]
+	idx.mu.RUnlock()
 
 	if !ok {
 		return plumbing.ZeroHash, plumbing.ErrObjectNotFound
@@ -201,20 +245,32 @@ func (idx *MemoryIndex) genOffsetHash() error {
 		return err
 	}
 
-	idx.offsetHash = make(map[int64]plumbing.Hash, count)
-	idx.offsetHashIsFull = true
+	offsetHash := make(map[int64]plumbing.Hash, count)
 
 	var hash plumbing.Hash
+	hash.ResetBySize(idx.objectIDSize)
+
 	i := uint32(0)
 	for firstLevel, fanoutValue := range idx.Fanout {
 		mappedFirstLevel := idx.FanoutMapping[firstLevel]
 		for secondLevel := uint32(0); i < fanoutValue; i++ {
-			copy(hash[:], idx.Names[mappedFirstLevel][secondLevel*objectIDLength:])
-			offset := int64(idx.getOffset(mappedFirstLevel, int(secondLevel)))
-			idx.offsetHash[offset] = hash
+			_, err = hash.Write(idx.Names[mappedFirstLevel][secondLevel*uint32(idx.idSize()):])
+			if err != nil {
+				return fmt.Errorf("cannot write name to hash: %w", err)
+			}
+
+			off, err := idx.getOffset(mappedFirstLevel, int(secondLevel))
+			if err != nil {
+				return err
+			}
+			offsetHash[int64(off)] = hash
 			secondLevel++
 		}
 	}
+
+	idx.mu.Lock()
+	idx.offsetHash = offsetHash
+	idx.mu.Unlock()
 
 	return nil
 }
@@ -259,6 +315,13 @@ func (idx *MemoryIndex) EntriesByOffset() (EntryIter, error) {
 	return iter, nil
 }
 
+func (idx *MemoryIndex) idSize() int {
+	if idx.objectIDSize != 0 {
+		return idx.objectIDSize
+	}
+	return crypto.SHA1.Size()
+}
+
 // EntryIter is an iterator that will return the entries in a packfile index.
 type EntryIter interface {
 	// Next returns the next entry in the packfile index.
@@ -287,8 +350,16 @@ func (i *idxfileEntryIter) Next() (*Entry, error) {
 
 		mappedFirstLevel := i.idx.FanoutMapping[i.firstLevel]
 		entry := new(Entry)
-		copy(entry.Hash[:], i.idx.Names[mappedFirstLevel][i.secondLevel*objectIDLength:])
-		entry.Offset = i.idx.getOffset(mappedFirstLevel, i.secondLevel)
+		entry.Hash.ResetBySize(i.idx.idSize())
+		_, err := entry.Hash.Write(i.idx.Names[mappedFirstLevel][i.secondLevel*i.idx.idSize():])
+		if err != nil {
+			return nil, fmt.Errorf("cannot write entry hash: %w", err)
+		}
+
+		entry.Offset, err = i.idx.getOffset(mappedFirstLevel, i.secondLevel)
+		if err != nil {
+			return nil, err
+		}
 		entry.CRC32 = i.idx.getCRC32(mappedFirstLevel, i.secondLevel)
 
 		i.secondLevel++
@@ -337,10 +408,10 @@ func (o entriesByOffset) Len() int {
 	return len(o)
 }
 
-func (o entriesByOffset) Less(i int, j int) bool {
+func (o entriesByOffset) Less(i, j int) bool {
 	return o[i].Offset < o[j].Offset
 }
 
-func (o entriesByOffset) Swap(i int, j int) {
+func (o entriesByOffset) Swap(i, j int) {
 	o[i], o[j] = o[j], o[i]
 }

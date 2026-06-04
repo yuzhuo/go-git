@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // ObjectLRU implements an object cache with an LRU eviction policy and a
@@ -14,7 +14,7 @@ type ObjectLRU struct {
 
 	actualSize FileSize
 	ll         *list.List
-	cache      map[interface{}]*list.Element
+	cache      map[any]*list.Element
 	mut        sync.Mutex
 }
 
@@ -38,7 +38,7 @@ func (c *ObjectLRU) Put(obj plumbing.EncodedObject) {
 
 	if c.cache == nil {
 		c.actualSize = 0
-		c.cache = make(map[interface{}]*list.Element, 1000)
+		c.cache = make(map[any]*list.Element, 1000)
 		c.ll = list.New()
 	}
 

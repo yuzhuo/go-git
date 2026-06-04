@@ -1,68 +1,84 @@
 package objfile
 
 import (
-	"compress/zlib"
 	"errors"
 	"io"
 	"strconv"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
+	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/utils/sync"
 )
 
-var (
-	ErrOverflow = errors.New("objfile: declared data length exceeded (overflow)")
-)
+// ErrOverflow is returned when the declared data length is exceeded.
+var ErrOverflow = errors.New("objfile: declared data length exceeded (overflow)")
 
 // Writer writes and encodes data in compressed objfile format to a provided
 // io.Writer. Close should be called when finished with the Writer. Close will
 // not close the underlying io.Writer.
 type Writer struct {
-	raw    io.Writer
-	zlib   io.WriteCloser
-	hasher plumbing.Hasher
-	multi  io.Writer
+	raw          io.Writer
+	hasher       plumbing.Hasher
+	multi        io.Writer
+	zlib         sync.ZlibWriter
+	objectFormat format.ObjectFormat
 
 	closed  bool
 	pending int64 // number of unwritten bytes
+
+	closeErr error
 }
 
-// NewWriter returns a new Writer writing to w.
+// NewWriter returns a new Writer writing to w and hashing objects with the
+// given object format.
 //
 // The returned Writer implements io.WriteCloser. Close should be called when
 // finished with the Writer. Close will not close the underlying io.Writer.
-func NewWriter(w io.Writer) *Writer {
+func NewWriter(w io.Writer, objectFormat format.ObjectFormat) *Writer {
+	zlib := sync.GetZlibWriter(w)
 	return &Writer{
-		raw:  w,
-		zlib: zlib.NewWriter(w),
+		raw:          w,
+		zlib:         zlib,
+		objectFormat: objectFormat,
 	}
 }
 
-// WriteHeader writes the type and the size and prepares to accept the object's
-// contents. If an invalid t is provided, plumbing.ErrInvalidType is returned. If a
-// negative size is provided, ErrNegativeSize is returned.
+// WriteHeader writes the type and the size and prepares to accept the
+// object's contents. If an invalid t is provided, plumbing.ErrInvalidType
+// is returned. If a negative size is provided, ErrNegativeSize is
+// returned. If the encoded header exceeds maxHeaderLen,
+// ErrHeaderTooLong is returned, mirroring the reader's bound.
 func (w *Writer) WriteHeader(t plumbing.ObjectType, size int64) error {
 	if !t.Valid() {
 		return plumbing.ErrInvalidType
 	}
+	return w.writeHeader(t, t.Bytes(), size)
+}
+
+func (w *Writer) writeHeader(t plumbing.ObjectType, typeBytes []byte, size int64) error {
 	if size < 0 {
 		return ErrNegativeSize
 	}
 
-	b := t.Bytes()
+	b := make([]byte, 0, maxHeaderLen)
+	b = append(b, typeBytes...)
 	b = append(b, ' ')
-	b = append(b, []byte(strconv.FormatInt(size, 10))...)
+	b = strconv.AppendInt(b, size, 10)
 	b = append(b, 0)
+
+	if len(b) > maxHeaderLen {
+		return ErrHeaderTooLong
+	}
 
 	defer w.prepareForWrite(t, size)
 	_, err := w.zlib.Write(b)
-
 	return err
 }
 
 func (w *Writer) prepareForWrite(t plumbing.ObjectType, size int64) {
 	w.pending = size
 
-	w.hasher = plumbing.NewHasher(t, size)
+	w.hasher = plumbing.NewHasher(w.objectFormat, t, size)
 	w.multi = io.MultiWriter(w.zlib, w.hasher)
 }
 
@@ -83,10 +99,10 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	w.pending -= int64(n)
 	if err == nil && overwrite {
 		err = ErrOverflow
-		return
+		return n, err
 	}
 
-	return
+	return n, err
 }
 
 // Hash returns the hash of the object data stream that has been written so far.
@@ -99,8 +115,17 @@ func (w *Writer) Hash() plumbing.Hash {
 //
 // Calling Close does not close the wrapped io.Writer originally passed to
 // NewWriter.
+//
+// It returns an error, if any. Close will return the same error if called
+// multiple times.
 func (w *Writer) Close() error {
+	if w.closed {
+		return w.closeErr
+	}
+
+	defer sync.PutZlibWriter(w.zlib)
 	if err := w.zlib.Close(); err != nil {
+		w.closeErr = err
 		return err
 	}
 

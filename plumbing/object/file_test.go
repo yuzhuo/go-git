@@ -1,23 +1,33 @@
 package object
 
 import (
+	"fmt"
 	"io"
+	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	"github.com/go-git/go-git/v5/plumbing/filemode"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/storage/filesystem"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/suite"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
 type FileSuite struct {
+	suite.Suite
 	BaseObjectsSuite
 }
 
-var _ = Suite(&FileSuite{})
+func TestFileSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(FileSuite))
+}
+
+func (s *FileSuite) SetupSuite() {
+	s.BaseObjectsSuite.SetupSuite(s.T())
+}
 
 type fileIterExpectedEntry struct {
 	Name string
@@ -42,31 +52,34 @@ var fileIterTests = []struct {
 	}},
 }
 
-func (s *FileSuite) TestIter(c *C) {
+func (s *FileSuite) TestIter() {
 	for i, t := range fileIterTests {
 		f := fixtures.ByURL(t.repo).One()
-		sto := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		sto := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = sto.Close() }()
 
 		h := plumbing.NewHash(t.commit)
 		commit, err := GetCommit(sto, h)
-		c.Assert(err, IsNil, Commentf("subtest %d: %v (%s)", i, err, t.commit))
+		s.NoError(err, fmt.Sprintf("subtest %d: %v (%s)", i, err, t.commit))
 
 		tree, err := commit.Tree()
-		c.Assert(err, IsNil)
+		s.NoError(err)
 
 		iter := NewFileIter(sto, tree)
 		for k := 0; k < len(t.files); k++ {
 			exp := t.files[k]
 			file, err := iter.Next()
-			c.Assert(err, IsNil, Commentf("subtest %d, iter %d, err=%v", i, k, err))
-			c.Assert(file.Mode, Equals, filemode.Regular)
-			c.Assert(file.Hash.IsZero(), Equals, false)
-			c.Assert(file.Hash, Equals, file.ID())
-			c.Assert(file.Name, Equals, exp.Name, Commentf("subtest %d, iter %d, name=%s, expected=%s", i, k, file.Name, exp.Hash))
-			c.Assert(file.Hash.String(), Equals, exp.Hash, Commentf("subtest %d, iter %d, hash=%v, expected=%s", i, k, file.Hash.String(), exp.Hash))
+			s.NoError(err, fmt.Sprintf("subtest %d, iter %d, err=%v", i, k, err))
+			s.Equal(filemode.Regular, file.Mode)
+			s.False(file.Hash.IsZero())
+			s.Equal(file.ID(), file.Hash)
+			s.Equal(exp.Name, file.Name, fmt.Sprintf("subtest %d, iter %d, name=%s, expected=%s", i, k, file.Name, exp.Hash))
+			s.Equal(exp.Hash, file.Hash.String(), fmt.Sprintf("subtest %d, iter %d, hash=%v, expected=%s", i, k, file.Hash.String(), exp.Hash))
 		}
 		_, err = iter.Next()
-		c.Assert(err, Equals, io.EOF)
+		s.ErrorIs(err, io.EOF)
 	}
 }
 
@@ -103,20 +116,23 @@ hs_err_pid*
 	},
 }
 
-func (s *FileSuite) TestContents(c *C) {
+func (s *FileSuite) TestContents() {
 	for i, t := range contentsTests {
 		f := fixtures.ByURL(t.repo).One()
-		sto := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		sto := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = sto.Close() }()
 
 		h := plumbing.NewHash(t.commit)
 		commit, err := GetCommit(sto, h)
-		c.Assert(err, IsNil, Commentf("subtest %d: %v (%s)", i, err, t.commit))
+		s.NoError(err, fmt.Sprintf("subtest %d: %v (%s)", i, err, t.commit))
 
 		file, err := commit.File(t.path)
-		c.Assert(err, IsNil)
+		s.NoError(err)
 		content, err := file.Contents()
-		c.Assert(err, IsNil)
-		c.Assert(content, Equals, t.contents, Commentf(
+		s.NoError(err)
+		s.Equal(t.contents, content, fmt.Sprintf(
 			"subtest %d: commit=%s, path=%s", i, t.commit, t.path))
 	}
 }
@@ -156,20 +172,23 @@ var linesTests = []struct {
 	},
 }
 
-func (s *FileSuite) TestLines(c *C) {
+func (s *FileSuite) TestLines() {
 	for i, t := range linesTests {
 		f := fixtures.ByURL(t.repo).One()
-		sto := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		sto := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = sto.Close() }()
 
 		h := plumbing.NewHash(t.commit)
 		commit, err := GetCommit(sto, h)
-		c.Assert(err, IsNil, Commentf("subtest %d: %v (%s)", i, err, t.commit))
+		s.NoError(err, fmt.Sprintf("subtest %d: %v (%s)", i, err, t.commit))
 
 		file, err := commit.File(t.path)
-		c.Assert(err, IsNil)
+		s.NoError(err)
 		lines, err := file.Lines()
-		c.Assert(err, IsNil)
-		c.Assert(lines, DeepEquals, t.lines, Commentf(
+		s.NoError(err)
+		s.Equal(t.lines, lines, fmt.Sprintf(
 			"subtest %d: commit=%s, path=%s", i, t.commit, t.path))
 	}
 }
@@ -190,17 +209,20 @@ var ignoreEmptyDirEntriesTests = []struct {
 //
 // At least this test has a high chance of panicking if
 // we don't ignore empty dirs.
-func (s *FileSuite) TestIgnoreEmptyDirEntries(c *C) {
+func (s *FileSuite) TestIgnoreEmptyDirEntries() {
 	for i, t := range ignoreEmptyDirEntriesTests {
 		f := fixtures.ByURL(t.repo).One()
-		sto := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		sto := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = sto.Close() }()
 
 		h := plumbing.NewHash(t.commit)
 		commit, err := GetCommit(sto, h)
-		c.Assert(err, IsNil, Commentf("subtest %d: %v (%s)", i, err, t.commit))
+		s.NoError(err, fmt.Sprintf("subtest %d: %v (%s)", i, err, t.commit))
 
 		tree, err := commit.Tree()
-		c.Assert(err, IsNil)
+		s.NoError(err)
 
 		iter := tree.Files()
 		defer iter.Close()
@@ -211,13 +233,13 @@ func (s *FileSuite) TestIgnoreEmptyDirEntries(c *C) {
 	}
 }
 
-func (s *FileSuite) TestFileIter(c *C) {
+func (s *FileSuite) TestFileIter() {
 	hash := plumbing.NewHash("1669dce138d9b841a518c64b10914d88f5e488ea")
 	commit, err := GetCommit(s.Storer, hash)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	tree, err := commit.Tree()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	expected := []string{
 		".gitignore",
@@ -229,33 +251,35 @@ func (s *FileSuite) TestFileIter(c *C) {
 	var count int
 	i := tree.Files()
 	i.ForEach(func(f *File) error {
-		c.Assert(f.Name, Equals, expected[count])
+		s.Equal(expected[count], f.Name)
 		count++
 		return nil
 	})
 
-	c.Assert(count, Equals, 4)
+	s.Equal(4, count)
 
 	count = 0
 	i = tree.Files()
-	i.ForEach(func(f *File) error {
+	i.ForEach(func(_ *File) error {
 		count++
 		return storer.ErrStop
 	})
 
-	c.Assert(count, Equals, 1)
+	s.Equal(1, count)
 }
 
-func (s *FileSuite) TestFileIterSubmodule(c *C) {
-	dotgit := fixtures.ByURL("https://github.com/git-fixtures/submodule.git").One().DotGit()
+func (s *FileSuite) TestFileIterSubmodule() {
+	dotgit, err := fixtures.ByURL("https://github.com/git-fixtures/submodule.git").One().DotGit()
+	s.Require().NoError(err)
 	st := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+	defer func() { _ = st.Close() }()
 
 	hash := plumbing.NewHash("b685400c1f9316f350965a5993d350bc746b0bf4")
 	commit, err := GetCommit(st, hash)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	tree, err := commit.Tree()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	expected := []string{
 		".gitmodules",
@@ -265,10 +289,10 @@ func (s *FileSuite) TestFileIterSubmodule(c *C) {
 	var count int
 	i := tree.Files()
 	i.ForEach(func(f *File) error {
-		c.Assert(f.Name, Equals, expected[count])
+		s.Equal(expected[count], f.Name)
 		count++
 		return nil
 	})
 
-	c.Assert(count, Equals, 2)
+	s.Equal(2, count)
 }

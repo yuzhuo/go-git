@@ -2,14 +2,13 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // Basic example of how to commit changes to the current branch to an existing
@@ -21,6 +20,7 @@ func main() {
 	// Opens an already existing repository.
 	r, err := git.PlainOpen(directory)
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	w, err := r.Worktree()
 	CheckIfError(err)
@@ -29,7 +29,7 @@ func main() {
 	// worktree of the project using the go standard library.
 	Info("echo \"hello world!\" > example-git-file")
 	filename := filepath.Join(directory, "example-git-file")
-	err = ioutil.WriteFile(filename, []byte("hello world!"), 0644)
+	err = os.WriteFile(filename, []byte("hello world!"), 0o644)
 	CheckIfError(err)
 
 	// Adds the new file to the staging area.

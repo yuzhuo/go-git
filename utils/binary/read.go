@@ -1,19 +1,24 @@
-// Package binary implements sintax-sugar functions on top of the standard
+// Package binary implements syntax-sugar functions on top of the standard
 // library binary package
 package binary
 
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"io"
-
-	"github.com/go-git/go-git/v5/plumbing"
+	"math"
 )
+
+// ErrIntegerOverflow is returned when a Git-format variable-width integer
+// would not fit into an int64 because the input declares more continuation
+// bytes than the type can hold.
+var ErrIntegerOverflow = errors.New("variable-width integer overflow")
 
 // Read reads structured binary data from r into data. Bytes are read and
 // decoded in BigEndian order
 // https://golang.org/pkg/encoding/binary/#Read
-func Read(r io.Reader, data ...interface{}) error {
+func Read(r io.Reader, data ...any) error {
 	for _, v := range data {
 		if err := binary.Read(r, binary.BigEndian, v); err != nil {
 			return err
@@ -80,18 +85,25 @@ func ReadUntilFromBufioReader(r *bufio.Reader, delim byte) ([]byte, error) {
 //
 // This is how the offset is saved in C:
 //
-//     dheader[pos] = ofs & 127;
-//     while (ofs >>= 7)
-//         dheader[--pos] = 128 | (--ofs & 127);
-//
+//	dheader[pos] = ofs & 127;
+//	while (ofs >>= 7)
+//	    dheader[--pos] = 128 | (--ofs & 127);
 func ReadVariableWidthInt(r io.Reader) (int64, error) {
 	var c byte
 	if err := Read(r, &c); err != nil {
 		return 0, err
 	}
 
-	var v = int64(c & maskLength)
+	v := int64(c & maskLength)
 	for c&maskContinue > 0 {
+		// Reject input that, after the v++ and shift below, would
+		// not fit in an int64. With v < (MaxInt64-127)>>7, the
+		// post-increment v is at most (MaxInt64-127)>>7 and the
+		// final (v << 7) + (c & 0x7F) stays within int64.
+		if v >= (math.MaxInt64-int64(maskLength))>>lengthBits {
+			return 0, ErrIntegerOverflow
+		}
+
 		v++
 		if err := Read(r, &c); err != nil {
 			return 0, err
@@ -139,28 +151,13 @@ func ReadUint16(r io.Reader) (uint16, error) {
 	return v, nil
 }
 
-// ReadHash reads a plumbing.Hash from r
-func ReadHash(r io.Reader) (plumbing.Hash, error) {
-	var h plumbing.Hash
-	if err := binary.Read(r, binary.BigEndian, h[:]); err != nil {
-		return plumbing.ZeroHash, err
-	}
-
-	return h, nil
-}
-
 const sniffLen = 8000
 
 // IsBinary detects if data is a binary value based on:
 // http://git.kernel.org/cgit/git/git.git/tree/xdiff-interface.c?id=HEAD#n198
 func IsBinary(r io.Reader) (bool, error) {
 	reader := bufio.NewReader(r)
-	c := 0
-	for {
-		if c == sniffLen {
-			break
-		}
-
+	for range sniffLen {
 		b, err := reader.ReadByte()
 		if err == io.EOF {
 			break
@@ -172,8 +169,6 @@ func IsBinary(r io.Reader) (bool, error) {
 		if b == byte(0) {
 			return true, nil
 		}
-
-		c++
 	}
 
 	return false, nil

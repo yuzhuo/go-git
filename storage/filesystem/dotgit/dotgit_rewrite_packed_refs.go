@@ -1,12 +1,14 @@
 package dotgit
 
 import (
+	"errors"
 	"io"
 	"os"
 	"runtime"
 
-	"github.com/go-git/go-billy/v5"
-	"github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-billy/v6"
+
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 func (d *DotGit) openAndLockPackedRefsMode() int {
@@ -18,7 +20,8 @@ func (d *DotGit) openAndLockPackedRefsMode() int {
 }
 
 func (d *DotGit) rewritePackedRefsWhileLocked(
-	tmp billy.File, pr billy.File) error {
+	tmp, pr billy.File,
+) error {
 	// Try plain rename. If we aren't using the bare Windows filesystem as the
 	// storage layer, we might be able to get away with a rename over a locked
 	// file.
@@ -29,7 +32,7 @@ func (d *DotGit) rewritePackedRefsWhileLocked(
 
 	// If we are in a filesystem that does not support rename (e.g. sivafs)
 	// a full copy is done.
-	if err == billy.ErrNotSupported {
+	if errors.Is(err, billy.ErrNotSupported) {
 		return d.copyNewFile(tmp, pr)
 	}
 
@@ -57,12 +60,12 @@ func (d *DotGit) copyToExistingFile(tmp, pr billy.File) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(pr, tmp)
+	_, err = ioutil.CopyBufferPool(pr, tmp)
 
 	return err
 }
 
-func (d *DotGit) copyNewFile(tmp billy.File, pr billy.File) (err error) {
+func (d *DotGit) copyNewFile(tmp, pr billy.File) (err error) {
 	prWrite, err := d.fs.Create(pr.Name())
 	if err != nil {
 		return err
@@ -75,7 +78,7 @@ func (d *DotGit) copyNewFile(tmp billy.File, pr billy.File) (err error) {
 		return err
 	}
 
-	_, err = io.Copy(prWrite, tmp)
+	_, err = ioutil.CopyBufferPool(prWrite, tmp)
 
 	return err
 }

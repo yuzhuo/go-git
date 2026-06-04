@@ -4,27 +4,31 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/color"
-	"github.com/go-git/go-git/v5/plumbing/filemode"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/color"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/format/config"
 )
 
-func Test(t *testing.T) { TestingT(t) }
+type UnifiedEncoderTestSuite struct {
+	suite.Suite
+}
 
-type UnifiedEncoderTestSuite struct{}
+func TestUnifiedEncoderTestSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(UnifiedEncoderTestSuite))
+}
 
-var _ = Suite(&UnifiedEncoderTestSuite{})
-
-func (s *UnifiedEncoderTestSuite) TestBothFilesEmpty(c *C) {
+func (s *UnifiedEncoderTestSuite) TestBothFilesEmpty() {
 	buffer := bytes.NewBuffer(nil)
 	e := NewUnifiedEncoder(buffer, 1)
 	err := e.Encode(testPatch{filePatches: []testFilePatch{{}}})
-	c.Assert(err, IsNil)
+	s.NoError(err)
 }
 
-func (s *UnifiedEncoderTestSuite) TestBinaryFile(c *C) {
+func (s *UnifiedEncoderTestSuite) TestBinaryFile() {
 	buffer := bytes.NewBuffer(nil)
 	e := NewUnifiedEncoder(buffer, 1)
 	p := testPatch{
@@ -44,15 +48,16 @@ func (s *UnifiedEncoderTestSuite) TestBinaryFile(c *C) {
 	}
 
 	err := e.Encode(p)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
-	c.Assert(buffer.String(), Equals, `diff --git a/binary b/binary
+	s.Equal(`diff --git a/binary b/binary
 index a459bc245bdbc45e1bca99e7fe61731da5c48da4..6879395eacf3cc7e5634064ccb617ac7aa62be7d 100644
 Binary files a/binary and b/binary differ
-`)
+`,
+		buffer.String())
 }
 
-func (s *UnifiedEncoderTestSuite) TestCustomSrcDstPrefix(c *C) {
+func (s *UnifiedEncoderTestSuite) TestCustomSrcDstPrefix() {
 	buffer := bytes.NewBuffer(nil)
 	e := NewUnifiedEncoder(buffer, 1).SetSrcPrefix("source/prefix/").SetDstPrefix("dest/prefix/")
 	p := testPatch{
@@ -72,25 +77,26 @@ func (s *UnifiedEncoderTestSuite) TestCustomSrcDstPrefix(c *C) {
 	}
 
 	err := e.Encode(p)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
-	c.Assert(buffer.String(), Equals, `diff --git source/prefix/binary dest/prefix/binary
+	s.Equal(`diff --git source/prefix/binary dest/prefix/binary
 index a459bc245bdbc45e1bca99e7fe61731da5c48da4..6879395eacf3cc7e5634064ccb617ac7aa62be7d 100644
 Binary files source/prefix/binary and dest/prefix/binary differ
-`)
+`,
+		buffer.String())
 }
 
-func (s *UnifiedEncoderTestSuite) TestEncode(c *C) {
+func (s *UnifiedEncoderTestSuite) TestEncode() {
 	for _, f := range fixtures {
-		c.Log("executing: ", f.desc)
+		s.T().Log("executing: ", f.desc)
 
 		buffer := bytes.NewBuffer(nil)
 		e := NewUnifiedEncoder(buffer, f.context).SetColor(f.color)
 
 		err := e.Encode(f.patch)
-		c.Assert(err, IsNil)
+		s.NoError(err)
 
-		c.Assert(buffer.String(), Equals, f.diff)
+		s.Equal(f.diff, buffer.String())
 	}
 }
 
@@ -178,7 +184,7 @@ var oneChunkPatchInverted Patch = testPatch{
 	}},
 }
 
-var fixtures []*fixture = []*fixture{{
+var fixtures = []*fixture{{
 	patch: testPatch{
 		message: "",
 		filePatches: []testFilePatch{{
@@ -1000,7 +1006,7 @@ type testPatch struct {
 }
 
 func (t testPatch) FilePatches() []FilePatch {
-	var result []FilePatch
+	result := make([]FilePatch, 0, len(t.filePatches))
 	for _, f := range t.filePatches {
 		result = append(result, f)
 	}
@@ -1020,6 +1026,7 @@ type testFilePatch struct {
 func (t testFilePatch) IsBinary() bool {
 	return len(t.chunks) == 0
 }
+
 func (t testFilePatch) Files() (File, File) {
 	// Go is amazing
 	switch {
@@ -1035,7 +1042,7 @@ func (t testFilePatch) Files() (File, File) {
 }
 
 func (t testFilePatch) Chunks() []Chunk {
-	var result []Chunk
+	result := make([]Chunk, 0, len(t.chunks))
 	for _, c := range t.chunks {
 		result = append(result, c)
 	}
@@ -1049,7 +1056,9 @@ type testFile struct {
 }
 
 func (t testFile) Hash() plumbing.Hash {
-	return plumbing.ComputeHash(plumbing.BlobObject, []byte(t.seed))
+	hasher := plumbing.FromObjectFormat(config.SHA1)
+	h, _ := hasher.Compute(plumbing.BlobObject, []byte(t.seed))
+	return h
 }
 
 func (t testFile) Mode() filemode.FileMode {

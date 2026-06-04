@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
 )
 
 // Pull changes from a remote repository
@@ -16,6 +16,7 @@ func main() {
 	// We instantiate a new repository targeting the given path (the .git folder)
 	r, err := git.PlainOpen(path)
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	// Get the working directory for the repository
 	w, err := r.Worktree()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -8,17 +9,17 @@ import (
 	"strings"
 
 	"github.com/emirpasic/gods/trees/binaryheap"
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	commitgraph_fmt "github.com/go-git/go-git/v5/plumbing/format/commitgraph"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/object/commitgraph"
-	"github.com/go-git/go-git/v5/storage/filesystem"
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/osfs"
 
-	"github.com/go-git/go-billy/v5"
-	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	commitgraph_fmt "github.com/go-git/go-git/v6/plumbing/format/commitgraph"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/object/commitgraph"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
 // Example how to resolve a revision into its commit counterpart
@@ -36,7 +37,7 @@ func main() {
 		CheckIfError(err)
 	}
 
-	s := filesystem.NewStorageWithOptions(fs, cache.NewObjectLRUDefault(), filesystem.Options{KeepDescriptors: true})
+	s := filesystem.NewStorage(fs, cache.NewObjectLRUDefault())
 	r, err := git.Open(s, fs)
 	CheckIfError(err)
 	defer s.Close()
@@ -131,7 +132,7 @@ func getFullPath(treePath, path string) string {
 
 func getFileHashes(c commitgraph.CommitNode, treePath string, paths []string) (map[string]plumbing.Hash, error) {
 	tree, err := getCommitTree(c, treePath)
-	if err == object.ErrDirectoryNotFound {
+	if errors.Is(err, object.ErrDirectoryNotFound) {
 		// The whole tree didn't exist, so return empty map
 		return make(map[string]plumbing.Hash), nil
 	}
@@ -156,7 +157,7 @@ func getFileHashes(c commitgraph.CommitNode, treePath string, paths []string) (m
 
 func getLastCommitForPaths(c commitgraph.CommitNode, treePath string, paths []string) (map[string]*object.Commit, error) {
 	// We do a tree traversal with nodes sorted by commit time
-	heap := binaryheap.NewWith(func(a, b interface{}) int {
+	heap := binaryheap.NewWith(func(a, b any) int {
 		if a.(*commitAndPaths).commit.CommitTime().Before(b.(*commitAndPaths).commit.CommitTime()) {
 			return 1
 		}
@@ -182,7 +183,7 @@ func getLastCommitForPaths(c commitgraph.CommitNode, treePath string, paths []st
 		// Load the parent commits for the one we are currently examining
 		numParents := current.commit.NumParents()
 		var parents []commitgraph.CommitNode
-		for i := 0; i < numParents; i++ {
+		for i := range numParents {
 			parent, err := current.commit.ParentNode(i)
 			if err != nil {
 				break

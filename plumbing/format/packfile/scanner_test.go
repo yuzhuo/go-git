@@ -2,327 +2,583 @@ package packfile
 
 import (
 	"bytes"
+	"compress/zlib"
+	"crypto/sha1"
+	"encoding/binary"
+	"errors"
 	"io"
+	"reflect"
+	"runtime"
+	"testing"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-billy/v6"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/internal/fixtureutil"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-type ScannerSuite struct {
-	fixtures.Suite
+func TestScan(t *testing.T) {
+	t.Parallel()
+
+	packs := fixtures.ByTag("scanner-entries")
+	require.GreaterOrEqual(t, len(packs), 2)
+
+	packs.Run(t, func(t *testing.T, f *fixtures.Fixture) {
+		t.Parallel()
+
+		entries := fixtureutil.ScannerEntries(f)
+		require.NotEmpty(t, entries)
+
+		var opts []ScannerOption
+		if f.ObjectFormat == "sha256" {
+			opts = append(opts, WithSHA256())
+		}
+
+		s := NewScanner(mustPackfile(t, f), opts...)
+		i := 0
+
+		for s.Scan() {
+			data := s.Data()
+			v := data.Value()
+
+			switch data.Section {
+			case HeaderSection:
+				gotHeader := v.(Header)
+				assert.Equal(t, 0, i, "wrong index")
+				assert.Equal(t, Version(2), gotHeader.Version)
+				assert.Equal(t, uint32(len(entries)), gotHeader.ObjectsQty)
+			case ObjectSection:
+				index := i - 1
+				oo := entries[index]
+
+				oh := v.(ObjectHeader)
+				assert.Equal(t, oo.Type, oh.Type, "type mismatch index: %d", index)
+				assert.Equal(t, oo.Offset, oh.Offset, "offset mismatch index: %d", index)
+				assert.Equal(t, oo.Size, oh.Size, "size mismatch index: %d", index)
+				assert.Equal(t, oo.Reference, oh.Reference, "reference mismatch index: %d", index)
+				assert.Equal(t, oo.OffsetReference, oh.OffsetReference, "offset reference mismatch index: %d", index)
+				if oo.Type != plumbing.OFSDeltaObject && oo.Type != plumbing.REFDeltaObject {
+					assert.Equal(t, oo.Hash.String(), oh.Hash.String(), "hash mismatch index: %d", index)
+				}
+				assert.Equal(t, oo.CRC32, oh.Crc32, "crc mismatch index: %d", index)
+			case FooterSection:
+				checksum := v.(plumbing.Hash)
+				assert.Equal(t, f.PackfileHash, checksum.String(), "pack hash mismatch")
+			}
+			i++
+		}
+
+		assert.NoError(t, s.Error())
+		assert.Equal(t, len(entries)+2, i)
+	})
 }
 
-var _ = Suite(&ScannerSuite{})
+func TestScannerRejectsReservedObjectType(t *testing.T) {
+	t.Parallel()
 
-func (s *ScannerSuite) TestHeader(c *C) {
-	r := fixtures.Basic().One().Packfile()
-	p := NewScanner(r)
+	pack, _ := buildTestPack(t, testPackObject{
+		typ:     plumbing.ObjectType(5),
+		content: nil,
+	})
+	scanner := NewScanner(bytes.NewReader(pack))
 
-	version, objects, err := p.Header()
-	c.Assert(err, IsNil)
-	c.Assert(version, Equals, VersionSupported)
-	c.Assert(objects, Equals, uint32(31))
-}
-
-func (s *ScannerSuite) TestNextObjectHeaderWithoutHeader(c *C) {
-	r := fixtures.Basic().One().Packfile()
-	p := NewScanner(r)
-
-	h, err := p.NextObjectHeader()
-	c.Assert(err, IsNil)
-	c.Assert(h, DeepEquals, &expectedHeadersOFS[0])
-
-	version, objects, err := p.Header()
-	c.Assert(err, IsNil)
-	c.Assert(version, Equals, VersionSupported)
-	c.Assert(objects, Equals, uint32(31))
-}
-
-func (s *ScannerSuite) TestNextObjectHeaderREFDelta(c *C) {
-	s.testNextObjectHeader(c, "ref-delta", expectedHeadersREF, expectedCRCREF)
-}
-
-func (s *ScannerSuite) TestNextObjectHeaderOFSDelta(c *C) {
-	s.testNextObjectHeader(c, "ofs-delta", expectedHeadersOFS, expectedCRCOFS)
-}
-
-func (s *ScannerSuite) testNextObjectHeader(c *C, tag string,
-	expected []ObjectHeader, expectedCRC []uint32) {
-
-	r := fixtures.Basic().ByTag(tag).One().Packfile()
-	p := NewScanner(r)
-
-	_, objects, err := p.Header()
-	c.Assert(err, IsNil)
-
-	for i := 0; i < int(objects); i++ {
-		h, err := p.NextObjectHeader()
-		c.Assert(err, IsNil)
-		c.Assert(*h, DeepEquals, expected[i])
-
-		buf := bytes.NewBuffer(nil)
-		n, crcFromScanner, err := p.NextObject(buf)
-		c.Assert(err, IsNil)
-		c.Assert(n, Equals, h.Length)
-		c.Assert(crcFromScanner, Equals, expectedCRC[i])
+	for scanner.Scan() {
 	}
 
-	n, err := p.Checksum()
-	c.Assert(err, IsNil)
-	c.Assert(n, HasLen, 20)
+	require.ErrorIs(t, scanner.Error(), ErrMalformedPackfile)
+	require.ErrorContains(t, scanner.Error(), "invalid object type")
 }
 
-func (s *ScannerSuite) TestNextObjectHeaderWithOutReadObject(c *C) {
-	f := fixtures.Basic().ByTag("ref-delta").One()
-	r := f.Packfile()
-	p := NewScanner(r)
+func BenchmarkScannerBasic(b *testing.B) {
+	f := mustPackfile(b, fixtures.Basic().One())
+	scanner := NewScanner(f)
+	for b.Loop() {
+		if err := scanner.Reset(); err != nil {
+			b.Fatal(err)
+		}
 
-	_, objects, err := p.Header()
-	c.Assert(err, IsNil)
+		for scanner.Scan() {
+		}
 
-	for i := 0; i < int(objects); i++ {
-		h, _ := p.NextObjectHeader()
-		c.Assert(err, IsNil)
-		c.Assert(*h, DeepEquals, expectedHeadersREF[i])
+		err := scanner.Error()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestPackHeaderSignature(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		scanner   *Scanner
+		nextState stateFn
+		wantErr   error
+	}{
+		{
+			name: "valid signature",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader([]byte("PACK")), nil, nil),
+			},
+			nextState: packVersion,
+		},
+		{
+			name: "invalid signature",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader([]byte("FOOBAR")), nil, nil),
+			},
+			wantErr: ErrBadSignature,
+		},
+		{
+			name: "invalid signature - too small",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader([]byte("FOO")), nil, nil),
+			},
+			wantErr: ErrMalformedPackfile,
+		},
+		{
+			name: "empty packfile: ErrEmptyPackfile",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader(nil), nil, nil),
+			},
+			wantErr: ErrEmptyPackfile,
+		},
 	}
 
-	err = p.discardObjectIfNeeded()
-	c.Assert(err, IsNil)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			next, err := packHeaderSignature(tc.scanner)
 
-	n, err := p.Checksum()
-	c.Assert(err, IsNil)
-	c.Assert(n.String(), Equals, f.PackfileHash)
+			if tc.wantErr == nil {
+				assert.Equal(t,
+					runtime.FuncForPC(reflect.ValueOf(tc.nextState).Pointer()).Name(),
+					runtime.FuncForPC(reflect.ValueOf(next).Pointer()).Name())
+
+				assert.NoError(t, err)
+			} else {
+				assert.Nil(t, next)
+				assert.ErrorIs(t, err, tc.wantErr)
+			}
+		})
+	}
 }
 
-func (s *ScannerSuite) TestNextObjectHeaderWithOutReadObjectNonSeekable(c *C) {
-	f := fixtures.Basic().ByTag("ref-delta").One()
-	r := io.MultiReader(f.Packfile())
-	p := NewScanner(r)
-
-	_, objects, err := p.Header()
-	c.Assert(err, IsNil)
-
-	for i := 0; i < int(objects); i++ {
-		h, _ := p.NextObjectHeader()
-		c.Assert(err, IsNil)
-		c.Assert(*h, DeepEquals, expectedHeadersREF[i])
+func TestPackVersion(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		scanner   *Scanner
+		version   Version
+		nextState stateFn
+		wantErr   error
+	}{
+		{
+			name:    "Version 2",
+			version: Version(2),
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 4))
+					binary.Write(buf, binary.BigEndian, uint32(2))
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			nextState: packObjectsQty,
+		},
+		{
+			name: "Version -1",
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 4))
+					binary.Write(buf, binary.BigEndian, -1) //nolint:staticcheck // intentionally testing invalid input
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			wantErr: io.EOF,
+		},
+		{
+			name: "Unsupported version",
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 4))
+					binary.Write(buf, binary.BigEndian, uint32(3))
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			wantErr: ErrUnsupportedVersion,
+		},
+		{
+			name: "empty packfile: EOF",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader(nil), nil, nil),
+			},
+			wantErr: io.EOF,
+		},
 	}
 
-	err = p.discardObjectIfNeeded()
-	c.Assert(err, IsNil)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			next, err := packVersion(tc.scanner)
 
-	n, err := p.Checksum()
-	c.Assert(err, IsNil)
-	c.Assert(n.String(), Equals, f.PackfileHash)
+			if tc.wantErr == nil {
+				assert.Equal(t,
+					runtime.FuncForPC(reflect.ValueOf(tc.nextState).Pointer()).Name(),
+					runtime.FuncForPC(reflect.ValueOf(next).Pointer()).Name())
+
+				assert.Equal(t, tc.version, tc.scanner.version)
+				assert.NoError(t, err)
+			} else {
+				assert.Nil(t, next)
+				assert.ErrorIs(t, err, tc.wantErr)
+			}
+		})
+	}
 }
 
-func (s *ScannerSuite) TestSeekObjectHeader(c *C) {
-	r := fixtures.Basic().One().Packfile()
-	p := NewScanner(r)
+func TestPackObjectQty(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		scanner   *Scanner
+		objects   uint32
+		nextState stateFn
+		wantErr   error
+	}{
+		{
+			name: "Zero",
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 4))
+					binary.Write(buf, binary.BigEndian, uint32(0))
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			nextState: packFooter, // if there are no objects, skip to footer.
+		},
+		{
+			name: "Valid number",
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 4))
+					binary.Write(buf, binary.BigEndian, uint32(7))
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			objects:   7,
+			nextState: nil,
+		},
+		{
+			name: "less than 2 bytes on source",
+			scanner: &Scanner{
+				scannerReader: func() *scannerReader {
+					buf := bytes.NewBuffer(make([]byte, 0, 2))
+					return newScannerReader(buf, nil, nil)
+				}(),
+			},
+			wantErr: io.EOF,
+		},
+		{
+			name: "empty packfile: EOF",
+			scanner: &Scanner{
+				scannerReader: newScannerReader(bytes.NewReader(nil), nil, nil),
+			},
+			wantErr: io.EOF,
+		},
+	}
 
-	h, err := p.SeekObjectHeader(expectedHeadersOFS[4].Offset)
-	c.Assert(err, IsNil)
-	c.Assert(h, DeepEquals, &expectedHeadersOFS[4])
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			next, err := packObjectsQty(tc.scanner)
+
+			if tc.wantErr == nil {
+				assert.Equal(t,
+					runtime.FuncForPC(reflect.ValueOf(tc.nextState).Pointer()).Name(),
+					runtime.FuncForPC(reflect.ValueOf(next).Pointer()).Name())
+
+				assert.Equal(t, tc.objects, tc.scanner.objects)
+				assert.NoError(t, err)
+			} else {
+				assert.Nil(t, next)
+				assert.ErrorIs(t, err, tc.wantErr)
+			}
+		})
+	}
 }
 
-func (s *ScannerSuite) TestSeekObjectHeaderNonSeekable(c *C) {
-	r := io.MultiReader(fixtures.Basic().One().Packfile())
-	p := NewScanner(r)
-
-	_, err := p.SeekObjectHeader(expectedHeadersOFS[4].Offset)
-	c.Assert(err, Equals, ErrSeekNotSupported)
+func mustPackfile(tb testing.TB, f *fixtures.Fixture) billy.File {
+	tb.Helper()
+	pf, err := f.Packfile()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return pf
 }
 
-func (s *ScannerSuite) TestReaderReset(c *C) {
-	r := fixtures.Basic().One().Packfile()
-	p := NewScanner(r)
+// buildMinimalPack writes a single-object packfile to a buffer.
+// The object header advertises declaredSize as the uncompressed length,
+// but the zlib payload supplied by compressedBody may inflate to more.
+// The SHA-1 footer is computed over all preceding bytes.
+func buildMinimalPack(tb testing.TB, typ plumbing.ObjectType, declaredSize int64, compressedBody []byte) []byte {
+	tb.Helper()
 
-	version, objects, err := p.Header()
-	c.Assert(err, IsNil)
-	c.Assert(version, Equals, VersionSupported)
-	c.Assert(objects, Equals, uint32(31))
+	var buf bytes.Buffer
+	h := sha1.New()
+	w := io.MultiWriter(&buf, h)
 
-	h, err := p.SeekObjectHeader(expectedHeadersOFS[0].Offset)
-	c.Assert(err, IsNil)
-	c.Assert(h, DeepEquals, &expectedHeadersOFS[0])
+	// Pack header: magic, version=2, count=1.
+	_, _ = w.Write([]byte{'P', 'A', 'C', 'K'})
+	_ = binary.Write(w, binary.BigEndian, uint32(2))
+	_ = binary.Write(w, binary.BigEndian, uint32(1))
 
-	p.Reset(r)
-	c.Assert(p.pendingObject, IsNil)
-	c.Assert(p.version, Equals, uint32(0))
-	c.Assert(p.objects, Equals, uint32(0))
-	c.Assert(p.r.reader, Equals, r)
-	c.Assert(p.r.offset > expectedHeadersOFS[0].Offset, Equals, true)
+	// Object header: variable-length encoding of (type, declaredSize).
+	// First byte: high nibble = type, low nibble = size[3:0]; MSB set
+	// if more size bytes follow. Subsequent bytes carry 7 bits each.
+	t := int64(typ)
+	first := byte((t << firstLengthBits) | (declaredSize & int64(maskFirstLength)))
+	sz := declaredSize >> firstLengthBits
+	var hdrBytes []byte
+	for sz != 0 {
+		hdrBytes = append(hdrBytes, first|maskContinue)
+		first = byte(sz & int64(maskLength))
+		sz >>= lengthBits
+	}
+	hdrBytes = append(hdrBytes, first)
+	_, _ = w.Write(hdrBytes)
 
-	p.Reset(bytes.NewReader(nil))
-	c.Assert(p.r.offset, Equals, int64(0))
+	// Compressed payload.
+	_, _ = w.Write(compressedBody)
+
+	// SHA-1 trailer (20 bytes).
+	_, _ = buf.Write(h.Sum(nil))
+
+	return buf.Bytes()
 }
 
-func (s *ScannerSuite) TestReaderResetSeeks(c *C) {
-	r := fixtures.Basic().One().Packfile()
+// TestInflateContentRejectsOversizedInflate verifies that inflateContent
+// stops reading and returns ErrInflatedSizeMismatch when an inflate exceeds
+// the bound passed in by the caller. The packfile is well-formed (declared
+// size matches the inflated payload) so the forward scan succeeds; the
+// rejection is forced by passing a smaller bound to inflateContent.
+func TestInflateContentRejectsOversizedInflate(t *testing.T) {
+	t.Parallel()
 
-	// seekable
-	p := NewScanner(r)
-	c.Assert(p.IsSeekable, Equals, true)
-	h, err := p.SeekObjectHeader(expectedHeadersOFS[0].Offset)
-	c.Assert(err, IsNil)
-	c.Assert(h, DeepEquals, &expectedHeadersOFS[0])
+	const size = 1 << 20 // 1 MiB
 
-	// reset with seekable
-	p.Reset(r)
-	c.Assert(p.IsSeekable, Equals, true)
-	h, err = p.SeekObjectHeader(expectedHeadersOFS[1].Offset)
-	c.Assert(err, IsNil)
-	c.Assert(h, DeepEquals, &expectedHeadersOFS[1])
+	var rawBuf bytes.Buffer
+	zw := zlib.NewWriter(&rawBuf)
+	_, err := zw.Write(make([]byte, size))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
 
-	// reset with non-seekable
-	f := fixtures.Basic().ByTag("ref-delta").One()
-	p.Reset(io.MultiReader(f.Packfile()))
-	c.Assert(p.IsSeekable, Equals, false)
+	pack := buildMinimalPack(t, plumbing.BlobObject, size, rawBuf.Bytes())
 
-	_, err = p.SeekObjectHeader(expectedHeadersOFS[4].Offset)
-	c.Assert(err, Equals, ErrSeekNotSupported)
+	s := NewScanner(bytes.NewReader(pack))
+
+	require.True(t, s.Scan(), "expected header section")
+	require.True(t, s.Scan(), "expected object section")
+	require.NoError(t, s.Error())
+
+	oh := s.Data().Value().(ObjectHeader)
+	require.Equal(t, plumbing.BlobObject, oh.Type)
+
+	var sink bytes.Buffer
+	// Force the bound to fire by declaring a much smaller cap to
+	// inflateContent than the actual inflated payload size.
+	inflateErr := s.inflateContent(oh.ContentOffset, &sink, 4096)
+
+	assert.ErrorIs(t, inflateErr, ErrInflatedSizeMismatch,
+		"expected ErrInflatedSizeMismatch from oversized inflate")
+	assert.LessOrEqual(t, int64(sink.Len()), int64(4096),
+		"inflated %d bytes but declared bound was %d", sink.Len(), 4096)
 }
 
-var expectedHeadersOFS = []ObjectHeader{
-	{Type: plumbing.CommitObject, Offset: 12, Length: 254},
-	{Type: plumbing.OFSDeltaObject, Offset: 186, Length: 93, OffsetReference: 12},
-	{Type: plumbing.CommitObject, Offset: 286, Length: 242},
-	{Type: plumbing.CommitObject, Offset: 449, Length: 242},
-	{Type: plumbing.CommitObject, Offset: 615, Length: 333},
-	{Type: plumbing.CommitObject, Offset: 838, Length: 332},
-	{Type: plumbing.CommitObject, Offset: 1063, Length: 244},
-	{Type: plumbing.CommitObject, Offset: 1230, Length: 243},
-	{Type: plumbing.CommitObject, Offset: 1392, Length: 187},
-	{Type: plumbing.BlobObject, Offset: 1524, Length: 189},
-	{Type: plumbing.BlobObject, Offset: 1685, Length: 18},
-	{Type: plumbing.BlobObject, Offset: 1713, Length: 1072},
-	{Type: plumbing.BlobObject, Offset: 2351, Length: 76110},
-	{Type: plumbing.BlobObject, Offset: 78050, Length: 2780},
-	{Type: plumbing.BlobObject, Offset: 78882, Length: 217848},
-	{Type: plumbing.BlobObject, Offset: 80725, Length: 706},
-	{Type: plumbing.BlobObject, Offset: 80998, Length: 11488},
-	{Type: plumbing.BlobObject, Offset: 84032, Length: 78},
-	{Type: plumbing.TreeObject, Offset: 84115, Length: 272},
-	{Type: plumbing.OFSDeltaObject, Offset: 84375, Length: 43, OffsetReference: 84115},
-	{Type: plumbing.TreeObject, Offset: 84430, Length: 38},
-	{Type: plumbing.TreeObject, Offset: 84479, Length: 75},
-	{Type: plumbing.TreeObject, Offset: 84559, Length: 38},
-	{Type: plumbing.TreeObject, Offset: 84608, Length: 34},
-	{Type: plumbing.BlobObject, Offset: 84653, Length: 9},
-	{Type: plumbing.OFSDeltaObject, Offset: 84671, Length: 6, OffsetReference: 84375},
-	{Type: plumbing.OFSDeltaObject, Offset: 84688, Length: 9, OffsetReference: 84375},
-	{Type: plumbing.OFSDeltaObject, Offset: 84708, Length: 6, OffsetReference: 84375},
-	{Type: plumbing.OFSDeltaObject, Offset: 84725, Length: 5, OffsetReference: 84115},
-	{Type: plumbing.OFSDeltaObject, Offset: 84741, Length: 8, OffsetReference: 84375},
-	{Type: plumbing.OFSDeltaObject, Offset: 84760, Length: 4, OffsetReference: 84741},
+// TestObjectEntryRejectsOversizedInflate verifies that the forward-scan
+// path (objectEntry) refuses to stream more inflated bytes into the hasher
+// and storer than the object header's declared size, by failing Scan with
+// ErrInflatedSizeMismatch.
+func TestObjectEntryRejectsOversizedInflate(t *testing.T) {
+	t.Parallel()
+
+	const realSize = 1 << 20  // 1 MiB actual content
+	const declaredSize = 4096 // 4 KiB declared in header — deliberately a lie
+
+	var rawBuf bytes.Buffer
+	zw := zlib.NewWriter(&rawBuf)
+	_, err := zw.Write(make([]byte, realSize))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	pack := buildMinimalPack(t, plumbing.BlobObject, declaredSize, rawBuf.Bytes())
+
+	s := NewScanner(bytes.NewReader(pack))
+
+	require.True(t, s.Scan(), "expected header section")
+	assert.False(t, s.Scan(), "expected object section to fail")
+	assert.ErrorIs(t, s.Error(), ErrInflatedSizeMismatch,
+		"expected ErrInflatedSizeMismatch from oversized inflate during scan")
 }
 
-var expectedCRCOFS = []uint32{
-	0xaa07ba4b,
-	0xf706df58,
-	0x12438846,
-	0x2905a38c,
-	0xd9429436,
-	0xbecfde4e,
-	0x780e4b3e,
-	0xdc18344f,
-	0xcf4e4280,
-	0x1f08118a,
-	0xafded7b8,
-	0xcc1428ed,
-	0x1631d22f,
-	0xbfff5850,
-	0xd108e1d8,
-	0x8e97ba25,
-	0x7316ff70,
-	0xdb4fce56,
-	0x901cce2c,
-	0xec4552b0,
-	0x847905bf,
-	0x3689459a,
-	0xe67af94a,
-	0xc2314a2e,
-	0xcd987848,
-	0x8a853a6d,
-	0x70c6518,
-	0x4f4108e2,
-	0xd6fe09e9,
-	0xf07a2804,
-	0x1d75d6be,
+// TestBoundedReadCloser exercises the contract used by FSObject.Reader and
+// ondemandObject.Reader: reads up to limit pass through, the byte just past
+// the limit surfaces ErrInflatedSizeMismatch, and exact-fit streams cleanly
+// reach io.EOF.
+func TestBoundedReadCloser(t *testing.T) {
+	t.Parallel()
+
+	t.Run("exact fit reads to EOF", func(t *testing.T) {
+		t.Parallel()
+
+		rc := io.NopCloser(bytes.NewReader([]byte("hello")))
+		b := NewBoundedReadCloser(rc, 5)
+		got, err := io.ReadAll(b)
+		require.NoError(t, err)
+		assert.Equal(t, "hello", string(got))
+	})
+
+	t.Run("overrun surfaces ErrInflatedSizeMismatch", func(t *testing.T) {
+		t.Parallel()
+
+		rc := io.NopCloser(bytes.NewReader([]byte("hello world")))
+		b := NewBoundedReadCloser(rc, 5)
+		got, err := io.ReadAll(b)
+		assert.ErrorIs(t, err, ErrInflatedSizeMismatch)
+		assert.Equal(t, "hello", string(got))
+	})
+
+	t.Run("Close forwards to underlying", func(t *testing.T) {
+		t.Parallel()
+
+		var closed bool
+		rc := readCloserFn{
+			Reader: bytes.NewReader(nil),
+			closeFn: func() error {
+				closed = true
+				return nil
+			},
+		}
+		b := NewBoundedReadCloser(rc, 0)
+		require.NoError(t, b.Close())
+		assert.True(t, closed)
+	})
+
+	t.Run("negative limit is treated as zero", func(t *testing.T) {
+		t.Parallel()
+
+		rc := io.NopCloser(bytes.NewReader([]byte("hello")))
+		b := NewBoundedReadCloser(rc, -1)
+		got, err := io.ReadAll(b)
+		assert.ErrorIs(t, err, ErrInflatedSizeMismatch)
+		assert.Empty(t, got)
+	})
 }
 
-var expectedHeadersREF = []ObjectHeader{
-	{Type: plumbing.CommitObject, Offset: 12, Length: 254},
-	{Type: plumbing.REFDeltaObject, Offset: 186, Length: 93,
-		Reference: plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881")},
-	{Type: plumbing.CommitObject, Offset: 304, Length: 242},
-	{Type: plumbing.CommitObject, Offset: 467, Length: 242},
-	{Type: plumbing.CommitObject, Offset: 633, Length: 333},
-	{Type: plumbing.CommitObject, Offset: 856, Length: 332},
-	{Type: plumbing.CommitObject, Offset: 1081, Length: 243},
-	{Type: plumbing.CommitObject, Offset: 1243, Length: 244},
-	{Type: plumbing.CommitObject, Offset: 1410, Length: 187},
-	{Type: plumbing.BlobObject, Offset: 1542, Length: 189},
-	{Type: plumbing.BlobObject, Offset: 1703, Length: 18},
-	{Type: plumbing.BlobObject, Offset: 1731, Length: 1072},
-	{Type: plumbing.BlobObject, Offset: 2369, Length: 76110},
-	{Type: plumbing.TreeObject, Offset: 78068, Length: 38},
-	{Type: plumbing.BlobObject, Offset: 78117, Length: 2780},
-	{Type: plumbing.TreeObject, Offset: 79049, Length: 75},
-	{Type: plumbing.BlobObject, Offset: 79129, Length: 217848},
-	{Type: plumbing.BlobObject, Offset: 80972, Length: 706},
-	{Type: plumbing.TreeObject, Offset: 81265, Length: 38},
-	{Type: plumbing.BlobObject, Offset: 81314, Length: 11488},
-	{Type: plumbing.TreeObject, Offset: 84752, Length: 34},
-	{Type: plumbing.BlobObject, Offset: 84797, Length: 78},
-	{Type: plumbing.TreeObject, Offset: 84880, Length: 271},
-	{Type: plumbing.REFDeltaObject, Offset: 85141, Length: 6,
-		Reference: plumbing.NewHash("a8d315b2b1c615d43042c3a62402b8a54288cf5c")},
-	{Type: plumbing.REFDeltaObject, Offset: 85176, Length: 37,
-		Reference: plumbing.NewHash("fb72698cab7617ac416264415f13224dfd7a165e")},
-	{Type: plumbing.BlobObject, Offset: 85244, Length: 9},
-	{Type: plumbing.REFDeltaObject, Offset: 85262, Length: 9,
-		Reference: plumbing.NewHash("fb72698cab7617ac416264415f13224dfd7a165e")},
-	{Type: plumbing.REFDeltaObject, Offset: 85300, Length: 6,
-		Reference: plumbing.NewHash("fb72698cab7617ac416264415f13224dfd7a165e")},
-	{Type: plumbing.TreeObject, Offset: 85335, Length: 110},
-	{Type: plumbing.REFDeltaObject, Offset: 85448, Length: 8,
-		Reference: plumbing.NewHash("eba74343e2f15d62adedfd8c883ee0262b5c8021")},
-	{Type: plumbing.TreeObject, Offset: 85485, Length: 73},
+// TestBoundedWriterOverrunJoinsWriteError pins the contract that a write
+// error from the underlying writer surfaced while writing the legal prefix
+// on overrun is joined with ErrInflatedSizeMismatch rather than silently
+// dropped.
+func TestBoundedWriterOverrunJoinsWriteError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("downstream write failure")
+	bw := &boundedWriter{w: errWriter{err: wantErr}, limit: 4}
+
+	n, err := bw.Write([]byte("hello"))
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, ErrInflatedSizeMismatch)
+	assert.ErrorIs(t, err, wantErr)
 }
 
-var expectedCRCREF = []uint32{
-	0xaa07ba4b,
-	0xfb4725a4,
-	0x12438846,
-	0x2905a38c,
-	0xd9429436,
-	0xbecfde4e,
-	0xdc18344f,
-	0x780e4b3e,
-	0xcf4e4280,
-	0x1f08118a,
-	0xafded7b8,
-	0xcc1428ed,
-	0x1631d22f,
-	0x847905bf,
-	0x3e20f31d,
-	0x3689459a,
-	0xd108e1d8,
-	0x71143d4a,
-	0xe67af94a,
-	0x739fb89f,
-	0xc2314a2e,
-	0x87864926,
-	0x415d752f,
-	0xf72fb182,
-	0x3ffa37d4,
-	0xcd987848,
-	0x2f20ac8f,
-	0xf2f0575,
-	0x7d8726e1,
-	0x740bf39,
-	0x26af4735,
+type errWriter struct{ err error }
+
+func (e errWriter) Write(_ []byte) (int, error) { return 0, e.err }
+
+type readCloserFn struct {
+	io.Reader
+	closeFn func() error
+}
+
+func (r readCloserFn) Close() error { return r.closeFn() }
+
+// TestScannerOFSDeltaBaseBoundary pins both halves of the OFS-delta
+// negative-offset predicate. An entry whose encoded offset equals its own
+// pack offset resolves to a base offset of zero, which points at the PACK
+// signature byte instead of a real object header; canonical Git rejects
+// such entries (see packfile.c:1289-1290 in v2.54.0 (94f057755b)). One
+// byte short of that boundary, the predicate must accept the value —
+// otherwise the test cannot distinguish the post-fix `>=` from the
+// pre-fix strict `>`.
+func TestScannerOFSDeltaBaseBoundary(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		negativeOffset byte
+		wantAccept     bool
+	}{
+		{
+			// delta_obj_offset - base_offset = 12 - 12 = 0; out of bounds.
+			name:           "rejects_at_own_offset",
+			negativeOffset: 0x0C,
+			wantAccept:     false,
+		},
+		{
+			// delta_obj_offset - base_offset = 12 - 11 = 1; one byte
+			// short of the boundary. The resolved base offset still
+			// falls inside the 12-byte pack header (which is invalid
+			// for a real object), but the scanner's predicate is
+			// strictly "base_offset > 0 AND < delta_obj_offset", and
+			// 1 satisfies both halves. Higher layers reject the bogus
+			// base when they fail to find an object at that offset;
+			// this test pins the predicate only.
+			name:           "accepts_one_byte_short_of_own_offset",
+			negativeOffset: 0x0B,
+			wantAccept:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			h := sha1.New()
+			w := io.MultiWriter(&buf, h)
+
+			// Pack header: magic, version=2, count=1.
+			_, _ = w.Write([]byte{'P', 'A', 'C', 'K'})
+			_ = binary.Write(w, binary.BigEndian, uint32(2))
+			_ = binary.Write(w, binary.BigEndian, uint32(1))
+
+			// Object header at offset 12: OFS-delta type (6), size 0,
+			// no size continuation.
+			_, _ = w.Write([]byte{byte(plumbing.OFSDeltaObject) << firstLengthBits})
+
+			_, _ = w.Write([]byte{tc.negativeOffset})
+
+			// A valid empty zlib stream so any code path past the
+			// validation has well-formed payload bytes to consume.
+			zw := zlib.NewWriter(w)
+			require.NoError(t, zw.Close())
+
+			// SHA-1 trailer over everything written so far.
+			_, _ = buf.Write(h.Sum(nil))
+
+			s := NewScanner(bytes.NewReader(buf.Bytes()))
+			require.True(t, s.Scan(), "expected header section")
+			got := s.Scan()
+			if tc.wantAccept {
+				require.True(t, got, "expected scanner to accept boundary-minus-one")
+				require.NoError(t, s.Error())
+			} else {
+				require.False(t, got, "OFS-delta with self-referencing offset must be rejected")
+				assert.ErrorIs(t, s.Error(), ErrMalformedPackfile)
+				assert.ErrorContains(t, s.Error(), "invalid OFS delta offset")
+			}
+		})
+	}
 }

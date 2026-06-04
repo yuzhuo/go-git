@@ -1,45 +1,79 @@
 package git
 
 import (
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	"github.com/go-git/go-git/v5/plumbing/format/packfile"
-	"github.com/go-git/go-git/v5/plumbing/transport"
-	"github.com/go-git/go-git/v5/storage/filesystem"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-billy/v6/osfs"
+	"github.com/go-git/go-billy/v6/util"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
 
-	"github.com/go-git/go-billy/v5"
-	"github.com/go-git/go-billy/v5/memfs"
-	"github.com/go-git/go-billy/v5/osfs"
-	"github.com/go-git/go-billy/v5/util"
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/go-git/go-git/v6/x/plugin"
+	xconfig "github.com/go-git/go-git/v6/x/plugin/config"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
 type BaseSuite struct {
-	fixtures.Suite
+	suite.Suite
 	Repository *Repository
 
-	backupProtocol transport.Transport
-	cache          map[string]*Repository
+	cache map[string]*Repository
 }
 
-func (s *BaseSuite) SetUpSuite(c *C) {
-	s.buildBasicRepository(c)
+func (s *BaseSuite) SetupSuite() {
+	s.buildBasicRepository()
+	r := s.Repository
+	s.T().Cleanup(func() {
+		if r != nil {
+			_ = r.Close()
+		}
+	})
 
 	s.cache = make(map[string]*Repository)
+	cache := s.cache
+	s.T().Cleanup(func() {
+		for _, r := range cache {
+			if r != nil {
+				_ = r.Close()
+			}
+		}
+	})
 }
 
-func (s *BaseSuite) TearDownSuite(c *C) {
-	s.Suite.TearDownSuite(c)
+// registerTestConfigLoader registers a static ConfigSource plugin with
+// default test user data. Tests that need specific config values should
+// register their own ConfigSource.
+func registerTestConfigLoader() {
+	resetPluginEntry("config-loader")
+
+	err := plugin.Register(plugin.ConfigLoader(), func() plugin.ConfigSource {
+		return xconfig.NewStatic(defaultTestConfig(), defaultTestConfig())
+	})
+	if err != nil {
+		panic(fmt.Errorf("failed to register config storers: %v", err))
+	}
 }
 
-func (s *BaseSuite) buildBasicRepository(c *C) {
+func defaultTestConfig() config.Config {
+	cfg := config.NewConfig()
+	cfg.User.Name = "Test User"
+	cfg.User.Email = "test@example.com"
+	return *cfg
+}
+
+func (s *BaseSuite) buildBasicRepository() {
 	f := fixtures.Basic().One()
 	s.Repository = s.NewRepository(f)
 }
@@ -48,25 +82,18 @@ func (s *BaseSuite) buildBasicRepository(c *C) {
 // is tagged as worktree the filesystem from fixture is used, otherwise a new
 // memfs filesystem is used as worktree.
 func (s *BaseSuite) NewRepository(f *fixtures.Fixture) *Repository {
-	var worktree, dotgit billy.Filesystem
+	dotgit, err := f.DotGit()
+	s.Require().NoError(err)
+	worktree := memfs.New()
 	if f.Is("worktree") {
-		r, err := PlainOpen(f.Worktree().Root())
-		if err != nil {
-			panic(err)
-		}
-
-		return r
+		worktree, err = f.Worktree()
+		s.Require().NoError(err)
 	}
-
-	dotgit = f.DotGit()
-	worktree = memfs.New()
 
 	st := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
 
 	r, err := Open(st, worktree)
-	if err != nil {
-		panic(err)
-	}
+	s.Require().NoError(err)
 
 	return r
 }
@@ -74,9 +101,12 @@ func (s *BaseSuite) NewRepository(f *fixtures.Fixture) *Repository {
 // NewRepositoryWithEmptyWorktree returns a new repository using the .git folder
 // from the fixture but without a empty memfs worktree, the index and the
 // modules are deleted from the .git folder.
-func (s *BaseSuite) NewRepositoryWithEmptyWorktree(f *fixtures.Fixture) *Repository {
-	dotgit := f.DotGit()
-	err := dotgit.Remove("index")
+func NewRepositoryWithEmptyWorktree(f *fixtures.Fixture) *Repository {
+	dotgit, err := f.DotGit()
+	if err != nil {
+		panic(err)
+	}
+	err = dotgit.Remove("index")
 	if err != nil {
 		panic(err)
 	}
@@ -96,7 +126,6 @@ func (s *BaseSuite) NewRepositoryWithEmptyWorktree(f *fixtures.Fixture) *Reposit
 	}
 
 	return r
-
 }
 
 func (s *BaseSuite) NewRepositoryFromPackfile(f *fixtures.Fixture) *Repository {
@@ -106,19 +135,15 @@ func (s *BaseSuite) NewRepositoryFromPackfile(f *fixtures.Fixture) *Repository {
 	}
 
 	storer := memory.NewStorage()
-	p := f.Packfile()
-	defer p.Close()
+	p, err := f.Packfile()
+	s.Require().NoError(err)
+	defer func() { _ = p.Close() }()
 
-	if err := packfile.UpdateObjectStorage(storer, p); err != nil {
-		panic(err)
-	}
-
-	storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash(f.Head)))
+	s.Require().NoError(packfile.UpdateObjectStorage(storer, p))
+	s.Require().NoError(storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash(f.Head))))
 
 	r, err := Open(storer, memfs.New())
-	if err != nil {
-		panic(err)
-	}
+	s.Require().NoError(err)
 
 	s.cache[h] = r
 	return r
@@ -130,41 +155,46 @@ func (s *BaseSuite) GetBasicLocalRepositoryURL() string {
 }
 
 func (s *BaseSuite) GetLocalRepositoryURL(f *fixtures.Fixture) string {
-	return f.DotGit().Root()
+	dotgit, err := f.DotGit(fixtures.WithTargetDir(s.T().TempDir))
+	s.Require().NoError(err)
+	return dotgit.Root()
 }
 
-func (s *BaseSuite) TemporalDir() (path string, clean func()) {
-	fs := osfs.New(os.TempDir())
-	path, err := util.TempDir(fs, "", "")
-	if err != nil {
-		panic(err)
+func (s *BaseSuite) TemporalHomeDir() (path string, clean func()) {
+	home, err := os.UserHomeDir()
+	s.Require().NoError(err)
+
+	fs := osfs.New(home)
+	relPath, err := util.TempDir(fs, "", "")
+	s.Require().NoError(err)
+
+	path = fs.Join(fs.Root(), relPath)
+	clean = func() {
+		_ = util.RemoveAll(fs, relPath)
 	}
 
-	return fs.Join(fs.Root(), path), func() {
-		util.RemoveAll(fs, path)
-	}
+	return path, clean
 }
 
-func (s *BaseSuite) TemporalFilesystem() (fs billy.Filesystem, clean func()) {
-	fs = osfs.New(os.TempDir())
+func (s *BaseSuite) TemporalFilesystem() (fs billy.Filesystem) {
+	fs = osfs.New(s.T().TempDir())
 	path, err := util.TempDir(fs, "", "")
-	if err != nil {
-		panic(err)
-	}
+	s.Require().NoError(err)
 
 	fs, err = fs.Chroot(path)
-	if err != nil {
-		panic(err)
-	}
+	s.Require().NoError(err)
 
-	return fs, func() {
-		util.RemoveAll(fs, path)
-	}
+	return fs
 }
 
-type SuiteCommon struct{}
+type SuiteCommon struct {
+	suite.Suite
+}
 
-var _ = Suite(&SuiteCommon{})
+func TestSuiteCommon(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(SuiteCommon))
+}
 
 var countLinesTests = [...]struct {
 	i string // the string we want to count lines from
@@ -181,20 +211,61 @@ var countLinesTests = [...]struct {
 	{"first line\n\tsecond line\nthird line\n", 3},
 }
 
-func (s *SuiteCommon) TestCountLines(c *C) {
+func (s *SuiteCommon) TestCountLines() {
 	for i, t := range countLinesTests {
 		o := countLines(t.i)
-		c.Assert(o, Equals, t.e, Commentf("subtest %d, input=%q", i, t.i))
+		s.Equal(t.e, o, fmt.Sprintf("subtest %d, input=%q", i, t.i))
 	}
 }
 
-func AssertReferences(c *C, r *Repository, expected map[string]string) {
+func AssertReferences(t *testing.T, r *Repository, expected map[string]string) {
 	for name, target := range expected {
 		expected := plumbing.NewReferenceFromStrings(name, target)
 
 		obtained, err := r.Reference(expected.Name(), true)
-		c.Assert(err, IsNil)
+		assert.NoError(t, err)
 
-		c.Assert(obtained, DeepEquals, expected)
+		assert.Equal(t, expected, obtained)
 	}
+}
+
+func AssertReferencesMissing(t *testing.T, r *Repository, expected []string) {
+	for _, name := range expected {
+		_, err := r.Reference(plumbing.ReferenceName(name), false)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, plumbing.ErrReferenceNotFound)
+	}
+}
+
+func CommitNewFile(t *testing.T, repo *Repository, fileName string) plumbing.Hash {
+	wt, err := repo.Worktree()
+	assert.NoError(t, err)
+
+	fd, err := wt.filesystem.Create(fileName)
+	assert.NoError(t, err)
+
+	_, err = fd.Write([]byte("# test file"))
+	assert.NoError(t, err)
+
+	err = fd.Close()
+	assert.NoError(t, err)
+
+	_, err = wt.Add(fileName)
+	assert.NoError(t, err)
+
+	sha, err := wt.Commit("test commit", &CommitOptions{
+		Author: &object.Signature{
+			Name:  "test",
+			Email: "test@example.com",
+			When:  time.Now(),
+		},
+		Committer: &object.Signature{
+			Name:  "test",
+			Email: "test@example.com",
+			When:  time.Now(),
+		},
+	})
+	assert.NoError(t, err)
+
+	return sha
 }

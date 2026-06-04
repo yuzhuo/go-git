@@ -6,59 +6,82 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
-	. "github.com/go-git/go-git/v5/plumbing/format/packfile"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/storage/filesystem"
+	"github.com/go-git/go-billy/v6/memfs"
+	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/suite"
 
-	"github.com/go-git/go-billy/v5/memfs"
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	. "github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
 type EncoderAdvancedSuite struct {
-	fixtures.Suite
+	suite.Suite
 }
 
-var _ = Suite(&EncoderAdvancedSuite{})
+func TestEncoderAdvancedSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(EncoderAdvancedSuite))
+}
 
-func (s *EncoderAdvancedSuite) TestEncodeDecode(c *C) {
+func (s *EncoderAdvancedSuite) TestEncodeDecode() {
 	if testing.Short() {
-		c.Skip("skipping test in short mode.")
+		s.T().Skip("skipping test in short mode.")
 	}
 
 	fixs := fixtures.Basic().ByTag("packfile").ByTag(".git")
 	fixs = append(fixs, fixtures.ByURL("https://github.com/src-d/go-git.git").
 		ByTag("packfile").ByTag(".git").One())
-	fixs.Test(c, func(f *fixtures.Fixture) {
-		storage := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
-		s.testEncodeDecode(c, storage, 10)
-	})
+
+	for _, f := range fixs {
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		storage := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = storage.Close() }()
+		s.testEncodeDecode(storage, 10)
+	}
 }
 
-func (s *EncoderAdvancedSuite) TestEncodeDecodeNoDeltaCompression(c *C) {
+func (s *EncoderAdvancedSuite) TestEncodeDecodeNoDeltaCompression() {
 	if testing.Short() {
-		c.Skip("skipping test in short mode.")
+		s.T().Skip("skipping test in short mode.")
 	}
 
 	fixs := fixtures.Basic().ByTag("packfile").ByTag(".git")
 	fixs = append(fixs, fixtures.ByURL("https://github.com/src-d/go-git.git").
 		ByTag("packfile").ByTag(".git").One())
-	fixs.Test(c, func(f *fixtures.Fixture) {
-		storage := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
-		s.testEncodeDecode(c, storage, 0)
-	})
+
+	for _, f := range fixs {
+		dotgit, err := f.DotGit()
+		s.Require().NoError(err)
+		storage := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+		defer func() { _ = storage.Close() }()
+		s.testEncodeDecode(storage, 0)
+	}
 }
 
 func (s *EncoderAdvancedSuite) testEncodeDecode(
-	c *C,
 	storage storer.Storer,
 	packWindow uint,
 ) {
+	objectFormat := formatcfg.DefaultObjectFormat
+	if cs, ok := storage.(interface {
+		Config() (*config.Config, error)
+	}); ok {
+		cfg, err := cs.Config()
+		s.Require().NoError(err)
+		if cfg.Extensions.ObjectFormat != formatcfg.UnsetObjectFormat {
+			objectFormat = cfg.Extensions.ObjectFormat
+		}
+	}
+
 	objIter, err := storage.IterEncodedObjects(plumbing.AnyObject)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	expectedObjects := map[plumbing.Hash]bool{}
 	var hashes []plumbing.Hash
@@ -66,9 +89,8 @@ func (s *EncoderAdvancedSuite) testEncodeDecode(
 		expectedObjects[o.Hash()] = true
 		hashes = append(hashes, o.Hash())
 		return err
-
 	})
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	// Shuffle hashes to avoid delta selector getting order right just because
 	// the initial order is correct.
@@ -81,55 +103,54 @@ func (s *EncoderAdvancedSuite) testEncodeDecode(
 	buf := bytes.NewBuffer(nil)
 	enc := NewEncoder(buf, storage, false)
 	encodeHash, err := enc.Encode(hashes, packWindow)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	fs := memfs.New()
 	f, err := fs.Create("packfile")
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	_, err = f.Write(buf.Bytes())
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	_, err = f.Seek(0, io.SeekStart)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	w := new(idxfile.Writer)
-	parser, err := NewParser(NewScanner(f), w)
-	c.Assert(err, IsNil)
+	parser := NewParser(NewScanner(f), WithScannerObservers(w), WithObjectFormat(objectFormat))
 
 	_, err = parser.Parse()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	index, err := w.Index()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
 	_, err = f.Seek(0, io.SeekStart)
-	c.Assert(err, IsNil)
+	s.NoError(err)
 
-	p := NewPackfile(index, fs, f)
+	p := NewPackfile(f, WithIdx(index), WithFs(fs), WithObjectIDSize(objectFormat.Size()))
 
 	decodeHash, err := p.ID()
-	c.Assert(err, IsNil)
-	c.Assert(encodeHash, Equals, decodeHash)
+	s.NoError(err)
+	s.Equal(decodeHash, encodeHash)
 
 	objIter, err = p.GetAll()
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	obtainedObjects := map[plumbing.Hash]bool{}
 	err = objIter.ForEach(func(o plumbing.EncodedObject) error {
 		obtainedObjects[o.Hash()] = true
 		return nil
 	})
-	c.Assert(err, IsNil)
-	c.Assert(obtainedObjects, DeepEquals, expectedObjects)
+	s.NoError(err)
+	s.Equal(expectedObjects, obtainedObjects)
 
 	for h := range obtainedObjects {
 		if !expectedObjects[h] {
-			c.Errorf("obtained unexpected object: %s", h)
+			s.T().Errorf("obtained unexpected object: %s", h)
 		}
 	}
 
 	for h := range expectedObjects {
 		if !obtainedObjects[h] {
-			c.Errorf("missing object: %s", h)
+			s.T().Errorf("missing object: %s", h)
 		}
 	}
 }

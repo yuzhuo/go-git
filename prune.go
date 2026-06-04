@@ -4,20 +4,25 @@ import (
 	"errors"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
-type PruneHandler func(unreferencedObjectHash plumbing.Hash) error
-type PruneOptions struct {
-	// OnlyObjectsOlderThan if set to non-zero value
-	// selects only objects older than the time provided.
-	OnlyObjectsOlderThan time.Time
-	// Handler is called on matching objects
-	Handler PruneHandler
-}
+type (
+	// PruneHandler is called for each unreferenced object during pruning.
+	PruneHandler func(unreferencedObjectHash plumbing.Hash) error
+	// PruneOptions configures the prune operation.
+	PruneOptions struct {
+		// OnlyObjectsOlderThan if set to non-zero value
+		// selects only objects older than the time provided.
+		OnlyObjectsOlderThan time.Time
+		// Handler is called on matching objects
+		Handler PruneHandler
+	}
+)
 
-var ErrLooseObjectsNotSupported = errors.New("Loose objects not supported")
+// ErrLooseObjectsNotSupported is returned when the storage does not support loose objects.
+var ErrLooseObjectsNotSupported = errors.New("loose objects not supported")
 
 // DeleteObject deletes an object from a repository.
 // The type conveniently matches PruneHandler.
@@ -30,6 +35,7 @@ func (r *Repository) DeleteObject(hash plumbing.Hash) error {
 	return los.DeleteLooseObject(hash)
 }
 
+// Prune removes unreferenced loose objects from the repository.
 func (r *Repository) Prune(opt PruneOptions) error {
 	los, ok := r.Storer.(storer.LooseObjectStorer)
 	if !ok {

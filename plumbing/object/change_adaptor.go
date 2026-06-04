@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/go-git/go-git/v5/utils/merkletrie"
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/utils/merkletrie"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
 // The following functions transform changes types form the merkletrie
@@ -16,11 +16,11 @@ func newChange(c merkletrie.Change) (*Change, error) {
 
 	var err error
 	if ret.From, err = newChangeEntry(c.From); err != nil {
-		return nil, fmt.Errorf("From field: %s", err)
+		return nil, fmt.Errorf("from field: %s", err)
 	}
 
 	if ret.To, err = newChangeEntry(c.To); err != nil {
-		return nil, fmt.Errorf("To field: %s", err)
+		return nil, fmt.Errorf("to field: %s", err)
 	}
 
 	return ret, nil

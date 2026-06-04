@@ -3,10 +3,10 @@ package git
 import (
 	"fmt"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/filemode"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/storage"
 )
 
 type objectWalker struct {
@@ -60,7 +60,7 @@ func (p *objectWalker) walkObjectTree(hash plumbing.Hash) error {
 	// Fetch the object.
 	obj, err := object.GetObject(p.Storer, hash)
 	if err != nil {
-		return fmt.Errorf("Getting object %s failed: %v", hash, err)
+		return fmt.Errorf("getting object %s failed: %v", hash, err)
 	}
 	// Walk all children depending on object type.
 	switch obj := obj.(type) {
@@ -84,7 +84,7 @@ func (p *objectWalker) walkObjectTree(hash plumbing.Hash) error {
 			// to handle plain files with different modes.
 			// Other non-tree objects are somewhat rare, so they
 			// are not special-cased.
-			if obj.Entries[i].Mode|0755 == filemode.Executable {
+			if obj.Entries[i].Mode|0o755 == filemode.Executable {
 				p.add(obj.Entries[i].Hash)
 				continue
 			}
@@ -98,7 +98,7 @@ func (p *objectWalker) walkObjectTree(hash plumbing.Hash) error {
 		return p.walkObjectTree(obj.Target)
 	default:
 		// Error out on unhandled object types.
-		return fmt.Errorf("Unknown object %X %s %T\n", obj.ID(), obj.Type(), obj)
+		return fmt.Errorf("unknown object %X %s %T", obj.ID(), obj.Type(), obj)
 	}
 	return nil
 }

@@ -1,78 +1,65 @@
 package transactional
 
 import (
+	"io"
 	"testing"
 
-	"github.com/go-git/go-billy/v5/memfs"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/cache"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/storage"
-	"github.com/go-git/go-git/v5/storage/filesystem"
-	"github.com/go-git/go-git/v5/storage/memory"
-	"github.com/go-git/go-git/v5/storage/test"
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
-type StorageSuite struct {
-	test.BaseStorageSuite
-	temporal func() storage.Storer
-}
-
-var _ = Suite(&StorageSuite{
-	temporal: func() storage.Storer {
-		return memory.NewStorage()
-	},
-})
-
-var _ = Suite(&StorageSuite{
-	temporal: func() storage.Storer {
-		fs := memfs.New()
-		return filesystem.NewStorage(fs, cache.NewObjectLRUDefault())
-	},
-})
-
-func (s *StorageSuite) SetUpTest(c *C) {
+func TestCommit(t *testing.T) {
+	t.Parallel()
 	base := memory.NewStorage()
-	temporal := s.temporal()
-
-	s.BaseStorageSuite = test.NewBaseStorageSuite(NewStorage(base, temporal))
-}
-
-func (s *StorageSuite) TestCommit(c *C) {
-	base := memory.NewStorage()
-	temporal := s.temporal()
+	temporal := filesystem.NewStorage(memfs.New(), cache.NewObjectLRUDefault())
 	st := NewStorage(base, temporal)
+	defer func() {
+		if closer, ok := st.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}()
 
 	commit := base.NewEncodedObject()
 	commit.SetType(plumbing.CommitObject)
 
 	_, err := st.SetEncodedObject(commit)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	ref := plumbing.NewHashReference("refs/a", commit.Hash())
-	c.Assert(st.SetReference(ref), IsNil)
+	require.NoError(t, st.SetReference(ref))
 
 	err = st.Commit()
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	ref, err = base.Reference(ref.Name())
-	c.Assert(err, IsNil)
-	c.Assert(ref.Hash(), Equals, commit.Hash())
+	require.NoError(t, err)
+	assert.Equal(t, commit.Hash(), ref.Hash())
 
 	obj, err := base.EncodedObject(plumbing.AnyObject, commit.Hash())
-	c.Assert(err, IsNil)
-	c.Assert(obj.Hash(), Equals, commit.Hash())
+	require.NoError(t, err)
+	assert.Equal(t, commit.Hash(), obj.Hash())
 }
 
-func (s *StorageSuite) TestTransactionalPackfileWriter(c *C) {
+func TestTransactionalPackfileWriter(t *testing.T) {
+	t.Parallel()
 	base := memory.NewStorage()
-	temporal := s.temporal()
+	temporal := storage.Storer(filesystem.NewStorage(memfs.New(), cache.NewObjectLRUDefault()))
 	st := NewStorage(base, temporal)
+	defer func() {
+		if closer, ok := st.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}()
 
 	_, tmpOK := temporal.(storer.PackfileWriter)
 	_, ok := st.(storer.PackfileWriter)
-	c.Assert(ok, Equals, tmpOK)
+	assert.Equal(t, tmpOK, ok)
 }

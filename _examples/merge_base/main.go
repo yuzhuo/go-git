@@ -3,9 +3,9 @@ package main
 import (
 	"os"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 type exitCode int
@@ -80,6 +80,7 @@ func main() {
 	// Open a git repository from current directory
 	repo, err := git.PlainOpen(path)
 	checkIfError(err, exitCodeCouldNotOpenRepository, "not in a git repository")
+	defer func() { _ = repo.Close() }()
 
 	// Get the hashes of the passed revisions
 	var hashes []*plumbing.Hash

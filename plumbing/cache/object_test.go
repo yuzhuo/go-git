@@ -6,14 +6,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
 type ObjectSuite struct {
+	suite.Suite
 	c       map[string]Object
 	aObject plumbing.EncodedObject
 	bObject plumbing.EncodedObject
@@ -22,9 +21,12 @@ type ObjectSuite struct {
 	eObject plumbing.EncodedObject
 }
 
-var _ = Suite(&ObjectSuite{})
+func TestObjectSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(ObjectSuite))
+}
 
-func (s *ObjectSuite) SetUpTest(c *C) {
+func (s *ObjectSuite) SetupTest() {
 	s.aObject = newObject("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1*Byte)
 	s.bObject = newObject("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 3*Byte)
 	s.cObject = newObject("cccccccccccccccccccccccccccccccccccccccc", 1*Byte)
@@ -36,16 +38,16 @@ func (s *ObjectSuite) SetUpTest(c *C) {
 	s.c["default_lru"] = NewObjectLRUDefault()
 }
 
-func (s *ObjectSuite) TestPutSameObject(c *C) {
+func (s *ObjectSuite) TestPutSameObject() {
 	for _, o := range s.c {
 		o.Put(s.aObject)
 		o.Put(s.aObject)
 		_, ok := o.Get(s.aObject.Hash())
-		c.Assert(ok, Equals, true)
+		s.True(ok)
 	}
 }
 
-func (s *ObjectSuite) TestPutSameObjectWithDifferentSize(c *C) {
+func (s *ObjectSuite) TestPutSameObjectWithDifferentSize() {
 	const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	cache := NewObjectLRU(7 * Byte)
@@ -54,25 +56,25 @@ func (s *ObjectSuite) TestPutSameObjectWithDifferentSize(c *C) {
 	cache.Put(newObject(hash, 5*Byte))
 	cache.Put(newObject(hash, 7*Byte))
 
-	c.Assert(cache.MaxSize, Equals, 7*Byte)
-	c.Assert(cache.actualSize, Equals, 7*Byte)
-	c.Assert(cache.ll.Len(), Equals, 1)
+	s.Equal(7*Byte, cache.MaxSize)
+	s.Equal(7*Byte, cache.actualSize)
+	s.Equal(1, cache.ll.Len())
 
 	obj, ok := cache.Get(plumbing.NewHash(hash))
-	c.Assert(obj.Hash(), Equals, plumbing.NewHash(hash))
-	c.Assert(FileSize(obj.Size()), Equals, 7*Byte)
-	c.Assert(ok, Equals, true)
+	s.Equal(plumbing.NewHash(hash), obj.Hash())
+	s.Equal(7*Byte, FileSize(obj.Size()))
+	s.True(ok)
 }
 
-func (s *ObjectSuite) TestPutBigObject(c *C) {
+func (s *ObjectSuite) TestPutBigObject() {
 	for _, o := range s.c {
 		o.Put(s.bObject)
 		_, ok := o.Get(s.aObject.Hash())
-		c.Assert(ok, Equals, false)
+		s.False(ok)
 	}
 }
 
-func (s *ObjectSuite) TestPutCacheOverflow(c *C) {
+func (s *ObjectSuite) TestPutCacheOverflow() {
 	// this test only works with an specific size
 	o := s.c["two_bytes"]
 
@@ -81,17 +83,17 @@ func (s *ObjectSuite) TestPutCacheOverflow(c *C) {
 	o.Put(s.dObject)
 
 	obj, ok := o.Get(s.aObject.Hash())
-	c.Assert(ok, Equals, false)
-	c.Assert(obj, IsNil)
+	s.False(ok)
+	s.Nil(obj)
 	obj, ok = o.Get(s.cObject.Hash())
-	c.Assert(ok, Equals, true)
-	c.Assert(obj, NotNil)
+	s.True(ok)
+	s.NotNil(obj)
 	obj, ok = o.Get(s.dObject.Hash())
-	c.Assert(ok, Equals, true)
-	c.Assert(obj, NotNil)
+	s.True(ok)
+	s.NotNil(obj)
 }
 
-func (s *ObjectSuite) TestEvictMultipleObjects(c *C) {
+func (s *ObjectSuite) TestEvictMultipleObjects() {
 	o := s.c["two_bytes"]
 
 	o.Put(s.cObject)
@@ -99,31 +101,31 @@ func (s *ObjectSuite) TestEvictMultipleObjects(c *C) {
 	o.Put(s.eObject) // this put should evict all previous objects
 
 	obj, ok := o.Get(s.cObject.Hash())
-	c.Assert(ok, Equals, false)
-	c.Assert(obj, IsNil)
+	s.False(ok)
+	s.Nil(obj)
 	obj, ok = o.Get(s.dObject.Hash())
-	c.Assert(ok, Equals, false)
-	c.Assert(obj, IsNil)
+	s.False(ok)
+	s.Nil(obj)
 	obj, ok = o.Get(s.eObject.Hash())
-	c.Assert(ok, Equals, true)
-	c.Assert(obj, NotNil)
+	s.True(ok)
+	s.NotNil(obj)
 }
 
-func (s *ObjectSuite) TestClear(c *C) {
+func (s *ObjectSuite) TestClear() {
 	for _, o := range s.c {
 		o.Put(s.aObject)
 		o.Clear()
 		obj, ok := o.Get(s.aObject.Hash())
-		c.Assert(ok, Equals, false)
-		c.Assert(obj, IsNil)
+		s.False(ok)
+		s.Nil(obj)
 	}
 }
 
-func (s *ObjectSuite) TestConcurrentAccess(c *C) {
+func (s *ObjectSuite) TestConcurrentAccess() {
 	for _, o := range s.c {
 		var wg sync.WaitGroup
 
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			wg.Add(3)
 			go func(i int) {
 				o.Put(newObject(fmt.Sprint(i), FileSize(i)))
@@ -147,13 +149,13 @@ func (s *ObjectSuite) TestConcurrentAccess(c *C) {
 	}
 }
 
-func (s *ObjectSuite) TestDefaultLRU(c *C) {
+func (s *ObjectSuite) TestDefaultLRU() {
 	defaultLRU := s.c["default_lru"].(*ObjectLRU)
 
-	c.Assert(defaultLRU.MaxSize, Equals, DefaultMaxSize)
+	s.Equal(DefaultMaxSize, defaultLRU.MaxSize)
 }
 
-func (s *ObjectSuite) TestObjectUpdateOverflow(c *C) {
+func (s *ObjectSuite) TestObjectUpdateOverflow() {
 	o := NewObjectLRU(9 * Byte)
 
 	a1 := newObject(s.aObject.Hash().String(), 9*Byte)

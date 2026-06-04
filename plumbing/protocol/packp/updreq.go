@@ -2,73 +2,28 @@ package packp
 
 import (
 	"errors"
-	"io"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 )
 
+// Errors returned by the updreq package.
 var (
 	ErrEmptyCommands    = errors.New("commands cannot be empty")
 	ErrMalformedCommand = errors.New("malformed command")
 )
 
-// ReferenceUpdateRequest values represent reference upload requests.
-// Values from this type are not zero-value safe, use the New function instead.
-type ReferenceUpdateRequest struct {
-	Capabilities *capability.List
+// UpdateRequests values represent reference upload requests.
+// The zero value is safe to use; Commands and Shallows can be populated
+// via append.
+type UpdateRequests struct {
+	Capabilities capability.List
 	Commands     []*Command
-	Shallow      *plumbing.Hash
-	// Packfile contains an optional packfile reader.
-	Packfile io.ReadCloser
-
-	// Progress receives sideband progress messages from the server
-	Progress sideband.Progress
+	Shallows     []plumbing.Hash
+	// TODO: Support push-cert
 }
 
-// New returns a pointer to a new ReferenceUpdateRequest value.
-func NewReferenceUpdateRequest() *ReferenceUpdateRequest {
-	return &ReferenceUpdateRequest{
-		// TODO: Add support for push-cert
-		Capabilities: capability.NewList(),
-		Commands:     nil,
-	}
-}
-
-// NewReferenceUpdateRequestFromCapabilities returns a pointer to a new
-// ReferenceUpdateRequest value, the request capabilities are filled with the
-// most optimal ones, based on the adv value (advertised capabilities), the
-// ReferenceUpdateRequest contains no commands
-//
-// It does set the following capabilities:
-//   - agent
-//   - report-status
-//   - ofs-delta
-//   - ref-delta
-//   - delete-refs
-// It leaves up to the user to add the following capabilities later:
-//   - atomic
-//   - ofs-delta
-//   - side-band
-//   - side-band-64k
-//   - quiet
-//   - push-cert
-func NewReferenceUpdateRequestFromCapabilities(adv *capability.List) *ReferenceUpdateRequest {
-	r := NewReferenceUpdateRequest()
-
-	if adv.Supports(capability.Agent) {
-		r.Capabilities.Set(capability.Agent, capability.DefaultAgent)
-	}
-
-	if adv.Supports(capability.ReportStatus) {
-		r.Capabilities.Set(capability.ReportStatus)
-	}
-
-	return r
-}
-
-func (req *ReferenceUpdateRequest) validate() error {
+func validateUpdateRequests(req *UpdateRequests) error {
 	if len(req.Commands) == 0 {
 		return ErrEmptyCommands
 	}
@@ -82,21 +37,25 @@ func (req *ReferenceUpdateRequest) validate() error {
 	return nil
 }
 
+// Action represents the action type of a command.
 type Action string
 
+// Action types.
 const (
 	Create  Action = "create"
-	Update         = "update"
-	Delete         = "delete"
-	Invalid        = "invalid"
+	Update  Action = "update"
+	Delete  Action = "delete"
+	Invalid Action = "invalid"
 )
 
+// Command represents a command to be executed on a reference.
 type Command struct {
 	Name plumbing.ReferenceName
 	Old  plumbing.Hash
 	New  plumbing.Hash
 }
 
+// Action returns the action type of the command.
 func (c *Command) Action() Action {
 	if c.Old == plumbing.ZeroHash && c.New == plumbing.ZeroHash {
 		return Invalid

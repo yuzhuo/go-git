@@ -1,8 +1,10 @@
 package transactional
 
 import (
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"errors"
+
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 // ObjectStorage implements the storer.EncodedObjectStorer for the transactional package.
@@ -25,7 +27,7 @@ func (o *ObjectStorage) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.H
 // HasEncodedObject honors the storer.EncodedObjectStorer interface.
 func (o *ObjectStorage) HasEncodedObject(h plumbing.Hash) error {
 	err := o.EncodedObjectStorer.HasEncodedObject(h)
-	if err == plumbing.ErrObjectNotFound {
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		return o.temporal.HasEncodedObject(h)
 	}
 
@@ -35,7 +37,7 @@ func (o *ObjectStorage) HasEncodedObject(h plumbing.Hash) error {
 // EncodedObjectSize honors the storer.EncodedObjectStorer interface.
 func (o *ObjectStorage) EncodedObjectSize(h plumbing.Hash) (int64, error) {
 	sz, err := o.EncodedObjectStorer.EncodedObjectSize(h)
-	if err == plumbing.ErrObjectNotFound {
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		return o.temporal.EncodedObjectSize(h)
 	}
 
@@ -45,7 +47,7 @@ func (o *ObjectStorage) EncodedObjectSize(h plumbing.Hash) (int64, error) {
 // EncodedObject honors the storer.EncodedObjectStorer interface.
 func (o *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
 	obj, err := o.EncodedObjectStorer.EncodedObject(t, h)
-	if err == plumbing.ErrObjectNotFound {
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		return o.temporal.EncodedObject(t, h)
 	}
 
@@ -81,4 +83,9 @@ func (o *ObjectStorage) Commit() error {
 		_, err := o.EncodedObjectStorer.SetEncodedObject(obj)
 		return err
 	})
+}
+
+// AddAlternate adds an alternate object directory.
+func (o *ObjectStorage) AddAlternate(remote string) error {
+	return o.temporal.AddAlternate(remote)
 }

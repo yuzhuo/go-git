@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // Basic example of how to list tags.
@@ -18,6 +18,7 @@ func main() {
 	// We instantiate a new repository targeting the given path (the .git folder)
 	r, err := git.PlainOpen(path)
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	// List all tag references, both lightweight tags and annotated tags
 	Info("git show-ref --tag")

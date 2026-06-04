@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"fmt"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/storage/filesystem/dotgit"
-	"github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 // ShallowStorage where the shallow commits are stored, an internal to
@@ -34,7 +34,7 @@ func (s *ShallowStorage) SetShallow(commits []plumbing.Hash) error {
 	return err
 }
 
-// Shallow return the shallow commits reading from shallo file from .git
+// Shallow returns the shallow commits reading from shallo file from .git
 func (s *ShallowStorage) Shallow() ([]plumbing.Hash, error) {
 	f, err := s.dir.Shallow()
 	if f == nil || err != nil {

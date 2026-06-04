@@ -1,218 +1,189 @@
 package http
 
 import (
-	"crypto/tls"
-	"fmt"
-	"io/ioutil"
-	"log"
-	"net"
+	"errors"
+	"io"
 	"net/http"
-	"net/http/cgi"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	fixtures "github.com/go-git/go-git-fixtures/v4"
-	. "gopkg.in/check.v1"
+	transport "github.com/go-git/go-git/v6/plumbing/transport"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
-type ClientSuite struct {
-	Endpoint  *transport.Endpoint
-	EmptyAuth transport.AuthMethod
-}
-
-var _ = Suite(&ClientSuite{})
-
-func (s *ClientSuite) SetUpSuite(c *C) {
-	var err error
-	s.Endpoint, err = transport.NewEndpoint(
-		"https://github.com/git-fixtures/basic",
-	)
-	c.Assert(err, IsNil)
-}
-
-func (s *UploadPackSuite) TestNewClient(c *C) {
-	roundTripper := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+func TestCheckError_SuccessCodes(t *testing.T) {
+	t.Parallel()
+	for code := http.StatusOK; code < http.StatusMultipleChoices; code++ {
+		assert.NoError(t, checkError(&http.Response{StatusCode: code}))
 	}
-	cl := &http.Client{Transport: roundTripper}
-	r, ok := NewClient(cl).(*client)
-	c.Assert(ok, Equals, true)
-	c.Assert(r.c, Equals, cl)
 }
 
-func (s *ClientSuite) TestNewBasicAuth(c *C) {
-	a := &BasicAuth{"foo", "qux"}
-
-	c.Assert(a.Name(), Equals, "http-basic-auth")
-	c.Assert(a.String(), Equals, "http-basic-auth - foo:*******")
-}
-
-func (s *ClientSuite) TestNewTokenAuth(c *C) {
-	a := &TokenAuth{"OAUTH-TOKEN-TEXT"}
-
-	c.Assert(a.Name(), Equals, "http-token-auth")
-	c.Assert(a.String(), Equals, "http-token-auth - *******")
-
-	// Check header is set correctly
-	req, err := http.NewRequest("GET", "https://github.com/git-fixtures/basic", nil)
-	c.Assert(err, Equals, nil)
-	a.SetAuth(req)
-	c.Assert(req.Header.Get("Authorization"), Equals, "Bearer OAUTH-TOKEN-TEXT")
-}
-
-func (s *ClientSuite) TestNewErrOK(c *C) {
-	res := &http.Response{StatusCode: http.StatusOK}
-	err := NewErr(res)
-	c.Assert(err, IsNil)
-}
-
-func (s *ClientSuite) TestNewErrUnauthorized(c *C) {
-	s.testNewHTTPError(c, http.StatusUnauthorized, "authentication required")
-}
-
-func (s *ClientSuite) TestNewErrForbidden(c *C) {
-	s.testNewHTTPError(c, http.StatusForbidden, "authorization failed")
-}
-
-func (s *ClientSuite) TestNewErrNotFound(c *C) {
-	s.testNewHTTPError(c, http.StatusNotFound, "repository not found")
-}
-
-func (s *ClientSuite) TestNewHTTPError40x(c *C) {
-	s.testNewHTTPError(c, http.StatusPaymentRequired,
-		"unexpected client error.*")
-}
-
-func (s *ClientSuite) testNewHTTPError(c *C, code int, msg string) {
-	req, _ := http.NewRequest("GET", "foo", nil)
-	res := &http.Response{
-		StatusCode: code,
+func TestCheckError_Unauthorized(t *testing.T) {
+	t.Parallel()
+	req, _ := http.NewRequest("GET", "https://example.com/repo.git", nil)
+	resp := &http.Response{
 		Request:    req,
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader("auth needed")),
 	}
-
-	err := NewErr(res)
-	c.Assert(err, NotNil)
-	c.Assert(err, ErrorMatches, msg)
+	err := checkError(resp)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, transport.ErrAuthenticationRequired))
+	var httpErr *Err
+	assert.True(t, errors.As(err, &httpErr))
+	assert.Equal(t, http.StatusUnauthorized, httpErr.StatusCode())
 }
 
-func (s *ClientSuite) TestSetAuth(c *C) {
-	auth := &BasicAuth{}
-	r, err := DefaultClient.NewUploadPackSession(s.Endpoint, auth)
-	c.Assert(err, IsNil)
-	c.Assert(auth, Equals, r.(*upSession).auth)
+func TestCheckError_Forbidden(t *testing.T) {
+	t.Parallel()
+	req, _ := http.NewRequest("GET", "https://example.com/repo.git", nil)
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusForbidden,
+		Body:       io.NopCloser(strings.NewReader("forbidden")),
+	}
+	err := checkError(resp)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, transport.ErrAuthorizationFailed))
 }
 
-type mockAuth struct{}
-
-func (*mockAuth) Name() string   { return "" }
-func (*mockAuth) String() string { return "" }
-
-func (s *ClientSuite) TestSetAuthWrongType(c *C) {
-	_, err := DefaultClient.NewUploadPackSession(s.Endpoint, &mockAuth{})
-	c.Assert(err, Equals, transport.ErrInvalidAuthMethod)
+func TestCheckError_NotFound(t *testing.T) {
+	t.Parallel()
+	req, _ := http.NewRequest("GET", "https://example.com/repo.git", nil)
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusNotFound,
+		Body:       io.NopCloser(strings.NewReader("not found")),
+	}
+	err := checkError(resp)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, transport.ErrRepositoryNotFound))
 }
 
-func (s *ClientSuite) TestModifyEndpointIfRedirect(c *C) {
-	sess := &session{endpoint: nil}
-	u, _ := url.Parse("https://example.com/info/refs")
-	res := &http.Response{Request: &http.Request{URL: u}}
-	c.Assert(func() {
-		sess.ModifyEndpointIfRedirect(res)
-	}, PanicMatches, ".*nil pointer dereference.*")
+func TestCheckError_Unknown(t *testing.T) {
+	t.Parallel()
+	req, _ := http.NewRequest("GET", "https://example.com/repo.git", nil)
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusPaymentRequired,
+		Body:       io.NopCloser(strings.NewReader("pay up")),
+	}
+	err := checkError(resp)
+	require.Error(t, err)
+	var httpErr *Err
+	assert.True(t, errors.As(err, &httpErr))
+	assert.Equal(t, http.StatusPaymentRequired, httpErr.StatusCode())
+	assert.Equal(t, "pay up", httpErr.Reason)
+}
 
-	sess = &session{endpoint: nil}
-	// no-op - should return and not panic
-	sess.ModifyEndpointIfRedirect(&http.Response{})
+func TestCheckError_WithReason(t *testing.T) {
+	t.Parallel()
+	req, _ := http.NewRequest("GET", "https://example.com/repo.git", nil)
+	resp := &http.Response{
+		Request:    req,
+		StatusCode: http.StatusInternalServerError,
+		Body:       io.NopCloser(strings.NewReader("server error details")),
+	}
+	err := checkError(resp)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server error details")
+}
 
-	data := []struct {
-		url      string
-		endpoint *transport.Endpoint
-		expected *transport.Endpoint
+func TestApplyRedirect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		baseURL   string
+		finalURL  string
+		wantURL   string
+		wantErr   string
+		noRequest bool
 	}{
-		{"https://example.com/foo/bar", nil, nil},
-		{"https://example.com/foo.git/info/refs",
-			&transport.Endpoint{},
-			&transport.Endpoint{Protocol: "https", Host: "example.com", Path: "/foo.git"}},
-		{"https://example.com:8080/foo.git/info/refs",
-			&transport.Endpoint{},
-			&transport.Endpoint{Protocol: "https", Host: "example.com", Port: 8080, Path: "/foo.git"}},
-	}
-
-	for _, d := range data {
-		u, _ := url.Parse(d.url)
-		sess := &session{endpoint: d.endpoint}
-		sess.ModifyEndpointIfRedirect(&http.Response{
-			Request: &http.Request{URL: u},
-		})
-		c.Assert(d.endpoint, DeepEquals, d.expected)
-	}
-}
-
-type BaseSuite struct {
-	fixtures.Suite
-
-	base string
-	host string
-	port int
-}
-
-func (s *BaseSuite) SetUpTest(c *C) {
-	l, err := net.Listen("tcp", "localhost:0")
-	c.Assert(err, IsNil)
-
-	base, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("go-git-http-%d", s.port))
-	c.Assert(err, IsNil)
-
-	s.port = l.Addr().(*net.TCPAddr).Port
-	s.base = filepath.Join(base, s.host)
-
-	err = os.MkdirAll(s.base, 0755)
-	c.Assert(err, IsNil)
-
-	cmd := exec.Command("git", "--exec-path")
-	out, err := cmd.CombinedOutput()
-	c.Assert(err, IsNil)
-
-	server := &http.Server{
-		Handler: &cgi.Handler{
-			Path: filepath.Join(strings.Trim(string(out), "\n"), "git-http-backend"),
-			Env:  []string{"GIT_HTTP_EXPORT_ALL=true", fmt.Sprintf("GIT_PROJECT_ROOT=%s", s.base)},
+		{
+			name:      "no redirect",
+			baseURL:   "https://example.com/repo.git",
+			wantURL:   "https://example.com/repo.git",
+			noRequest: true,
+		},
+		{
+			name:     "redirect updates host",
+			baseURL:  "https://old.example.com/repo.git",
+			finalURL: "https://new.example.com/repo.git/info/refs",
+			wantURL:  "https://new.example.com/repo.git",
+		},
+		{
+			name:     "same host and path is no-op",
+			baseURL:  "https://example.com/repo.git",
+			finalURL: "https://example.com/repo.git/info/refs",
+			wantURL:  "https://example.com/repo.git",
+		},
+		{
+			name:     "unsupported scheme",
+			baseURL:  "https://example.com/repo.git",
+			finalURL: "ftp://evil.com/repo.git/info/refs",
+			wantErr:  "unsupported scheme",
+		},
+		{
+			name:     "tail mismatch",
+			baseURL:  "https://example.com/repo.git",
+			finalURL: "https://evil.com/malicious-path",
+			wantErr:  "does not end with",
+		},
+		{
+			name:     "redirect updates scheme for http to https",
+			baseURL:  "http://example.com/repo.git",
+			finalURL: "https://example.com/repo.git/info/refs",
+			wantURL:  "https://example.com/repo.git",
+		},
+		{
+			name:     "redirect rejects scheme downgrade",
+			baseURL:  "https://example.com/repo.git",
+			finalURL: "http://example.com/repo.git/info/refs",
+			wantErr:  "changes scheme",
+		},
+		{
+			name:     "redirect updates path",
+			baseURL:  "https://example.com/old-repo.git",
+			finalURL: "https://example.com/new-repo.git/info/refs",
+			wantURL:  "https://example.com/new-repo.git",
+		},
+		{
+			name:     "redirect to bare repo path errors",
+			baseURL:  "https://example.com/repo.git",
+			finalURL: "https://example.com/repo.git",
+			wantErr:  "does not end with",
 		},
 	}
-	go func() {
-		log.Fatal(server.Serve(l))
-	}()
-}
 
-func (s *BaseSuite) prepareRepository(c *C, f *fixtures.Fixture, name string) *transport.Endpoint {
-	fs := f.DotGit()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	err := fixtures.EnsureIsBare(fs)
-	c.Assert(err, IsNil)
+			base, err := url.Parse(tt.baseURL)
+			require.NoError(t, err)
 
-	path := filepath.Join(s.base, name)
-	err = os.Rename(fs.Root(), path)
-	c.Assert(err, IsNil)
+			resp := &http.Response{}
+			if !tt.noRequest {
+				req, err := http.NewRequest("GET", tt.finalURL, nil)
+				require.NoError(t, err)
+				resp.Request = req
+			}
 
-	return s.newEndpoint(c, name)
-}
+			result, err := applyRedirect(resp, base)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
 
-func (s *BaseSuite) newEndpoint(c *C, name string) *transport.Endpoint {
-	ep, err := transport.NewEndpoint(fmt.Sprintf("http://localhost:%d/%s", s.port, name))
-	c.Assert(err, IsNil)
-
-	return ep
-}
-
-func (s *BaseSuite) TearDownTest(c *C) {
-	err := os.RemoveAll(s.base)
-	c.Assert(err, IsNil)
+			require.NoError(t, err)
+			want, err := url.Parse(tt.wantURL)
+			require.NoError(t, err)
+			assert.Equal(t, want, result)
+		})
+	}
 }

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/go-git/go-git/v5/utils/merkletrie"
+	"github.com/go-git/go-git/v6/utils/merkletrie"
 )
 
 // Change values represent a detected change between two git trees.  For
@@ -39,12 +39,12 @@ func (c *Change) Action() (merkletrie.Action, error) {
 	return merkletrie.Modify, nil
 }
 
-// Files return the files before and after a change.
+// Files returns the files before and after a change.
 // For insertions from will be nil. For deletions to will be nil.
 func (c *Change) Files() (from, to *File, err error) {
 	action, err := c.Action()
 	if err != nil {
-		return
+		return from, to, err
 	}
 
 	if action == merkletrie.Insert || action == merkletrie.Modify {
@@ -54,7 +54,7 @@ func (c *Change) Files() (from, to *File, err error) {
 		}
 
 		if err != nil {
-			return
+			return from, to, err
 		}
 	}
 
@@ -65,11 +65,11 @@ func (c *Change) Files() (from, to *File, err error) {
 		}
 
 		if err != nil {
-			return
+			return from, to, err
 		}
 	}
 
-	return
+	return from, to, err
 }
 
 func (c *Change) String() string {
@@ -87,10 +87,10 @@ func (c *Change) Patch() (*Patch, error) {
 	return c.PatchContext(context.Background())
 }
 
-// Patch returns a Patch with all the file changes in chunks. This
+// PatchContext returns a Patch with all the file changes in chunks. This
 // representation can be used to create several diff outputs.
-// If context expires, an non-nil error will be returned
-// Provided context must be non-nil
+// If context expires, an non-nil error will be returned.
+// Provided context must be non-nil.
 func (c *Change) PatchContext(ctx context.Context) (*Patch, error) {
 	return getPatchContext(ctx, "", c)
 }
@@ -150,10 +150,10 @@ func (c Changes) Patch() (*Patch, error) {
 	return c.PatchContext(context.Background())
 }
 
-// Patch returns a Patch with all the changes in chunks. This
+// PatchContext returns a Patch with all the changes in chunks. This
 // representation can be used to create several diff outputs.
-// If context expires, an non-nil error will be returned
-// Provided context must be non-nil
+// If context expires, an non-nil error will be returned.
+// Provided context must be non-nil.
 func (c Changes) PatchContext(ctx context.Context) (*Patch, error) {
 	return getPatchContext(ctx, "", c...)
 }

@@ -5,10 +5,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/object"
-
-	. "github.com/go-git/go-git/v5/_examples"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // Example of an specific use case:
@@ -28,8 +27,9 @@ func main() {
 	// and fetching the objects, exactly as:
 	Info("git clone %s %s", url, path)
 
-	r, err := git.PlainClone(path, false, &git.CloneOptions{URL: url})
+	r, err := git.PlainClone(path, &git.CloneOptions{URL: url})
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	// Getting the latest commit on the current branch
 	Info("git log -1")

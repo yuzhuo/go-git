@@ -1,47 +1,56 @@
 package config
 
 import (
-	"github.com/go-git/go-git/v5/plumbing"
+	"testing"
 
-	. "gopkg.in/check.v1"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-type BranchSuite struct{}
-
-var _ = Suite(&BranchSuite{})
-
-func (b *BranchSuite) TestValidateName(c *C) {
-	goodBranch := Branch{
-		Name:   "master",
-		Remote: "some_remote",
-		Merge:  "refs/heads/master",
-	}
-	badBranch := Branch{
-		Remote: "some_remote",
-		Merge:  "refs/heads/master",
-	}
-	c.Assert(goodBranch.Validate(), IsNil)
-	c.Assert(badBranch.Validate(), NotNil)
+type BranchSuite struct {
+	suite.Suite
 }
 
-func (b *BranchSuite) TestValidateMerge(c *C) {
+func TestBranchSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(BranchSuite))
+}
+
+func (b *BranchSuite) TestValidateName() {
 	goodBranch := Branch{
 		Name:   "master",
 		Remote: "some_remote",
 		Merge:  "refs/heads/master",
 	}
 	badBranch := Branch{
+		Remote: "some_remote",
+		Merge:  "refs/heads/master",
+	}
+	b.Nil(goodBranch.Validate())
+	b.NotNil(badBranch.Validate())
+}
+
+func (b *BranchSuite) TestValidateMerge() {
+	// Real git allows any value for branch.*.merge.
+	refsBranch := Branch{
+		Name:   "master",
+		Remote: "some_remote",
+		Merge:  "refs/heads/master",
+	}
+	nonRefsBranch := Branch{
 		Name:   "master",
 		Remote: "some_remote",
 		Merge:  "blah",
 	}
-	c.Assert(goodBranch.Validate(), IsNil)
-	c.Assert(badBranch.Validate(), NotNil)
+	b.Nil(refsBranch.Validate())
+	b.Nil(nonRefsBranch.Validate())
 }
 
-func (b *BranchSuite) TestMarshal(c *C) {
+func (b *BranchSuite) TestMarshal() {
 	expected := []byte(`[core]
 	bare = false
+	filemode = true
 [branch "branch-tracking-on-clone"]
 	remote = fork
 	merge = refs/heads/branch-tracking-on-clone
@@ -57,11 +66,11 @@ func (b *BranchSuite) TestMarshal(c *C) {
 	}
 
 	actual, err := cfg.Marshal()
-	c.Assert(err, IsNil)
-	c.Assert(string(actual), Equals, string(expected))
+	b.NoError(err)
+	b.Equal(string(expected), string(actual))
 }
 
-func (b *BranchSuite) TestUnmarshal(c *C) {
+func (b *BranchSuite) TestUnmarshal() {
 	input := []byte(`[core]
 	bare = false
 [branch "branch-tracking-on-clone"]
@@ -72,10 +81,51 @@ func (b *BranchSuite) TestUnmarshal(c *C) {
 
 	cfg := NewConfig()
 	err := cfg.Unmarshal(input)
-	c.Assert(err, IsNil)
+	b.NoError(err)
 	branch := cfg.Branches["branch-tracking-on-clone"]
-	c.Assert(branch.Name, Equals, "branch-tracking-on-clone")
-	c.Assert(branch.Remote, Equals, "fork")
-	c.Assert(branch.Merge, Equals, plumbing.ReferenceName("refs/heads/branch-tracking-on-clone"))
-	c.Assert(branch.Rebase, Equals, "interactive")
+	b.Equal("branch-tracking-on-clone", branch.Name)
+	b.Equal("fork", branch.Remote)
+	b.Equal(plumbing.ReferenceName("refs/heads/branch-tracking-on-clone"), branch.Merge)
+	b.Equal("interactive", branch.Rebase)
+}
+
+func (b *BranchSuite) TestValidateMergeWithPullRef() {
+	// Regression test for https://github.com/go-git/go-git/issues/1871
+	// branch.merge should allow refs/pull/<ID>/head (used by GitHub/GitLab PRs)
+	prBranch := Branch{
+		Name:   "contributor/fix-9999",
+		Remote: "upstream",
+		Merge:  "refs/pull/9999/head",
+	}
+	b.Nil(prBranch.Validate())
+
+	mrBranch := Branch{
+		Name:   "contributor/fix-42",
+		Remote: "origin",
+		Merge:  "refs/merge-requests/42/head",
+	}
+	b.Nil(mrBranch.Validate())
+}
+
+func (b *BranchSuite) TestUnmarshalNonRefsPrefix() {
+	// Real git allows any value for branch.*.merge during config read.
+	// unmarshal should not reject merge values that lack a refs/ prefix.
+	input := []byte(`[core]
+	bare = false
+[branch "foo"]
+	remote = origin
+	merge = main
+`)
+
+	cfg := NewConfig()
+	err := cfg.Unmarshal(input)
+	b.NoError(err)
+	branch := cfg.Branches["foo"]
+	b.Equal("foo", branch.Name)
+	b.Equal("origin", branch.Remote)
+	b.Equal(plumbing.ReferenceName("main"), branch.Merge)
+
+	// Validate must also accept this value so that SetConfig (which
+	// calls Validate) works for configs read from disk.
+	b.NoError(branch.Validate())
 }

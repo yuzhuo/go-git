@@ -3,253 +3,258 @@ package packp
 import (
 	"bytes"
 	"io"
+	"strings"
+	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 )
 
-type AdvRefSuite struct{}
-
-var _ = Suite(&AdvRefSuite{})
-
-func (s *AdvRefSuite) TestAddReferenceSymbolic(c *C) {
-	ref := plumbing.NewSymbolicReference("foo", "bar")
-
-	a := NewAdvRefs()
-	err := a.AddReference(ref)
-	c.Assert(err, IsNil)
-
-	values := a.Capabilities.Get(capability.SymRef)
-	c.Assert(values, HasLen, 1)
-	c.Assert(values[0], Equals, "foo:bar")
+type AdvRefSuite struct {
+	suite.Suite
 }
 
-func (s *AdvRefSuite) TestAddReferenceHash(c *C) {
-	ref := plumbing.NewHashReference("foo", plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
-
-	a := NewAdvRefs()
-	err := a.AddReference(ref)
-	c.Assert(err, IsNil)
-
-	c.Assert(a.References, HasLen, 1)
-	c.Assert(a.References["foo"].String(), Equals, "5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c")
+func TestAdvRefSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(AdvRefSuite))
 }
 
-func (s *AdvRefSuite) TestAllReferences(c *C) {
+func refByName(refs []*plumbing.Reference, name plumbing.ReferenceName) *plumbing.Reference {
+	for _, ref := range refs {
+		if ref.Name() == name {
+			return ref
+		}
+	}
+	return nil
+}
+
+func (s *AdvRefSuite) TestResolvedReferencesSymref() {
 	hash := plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c")
 
-	a := NewAdvRefs()
-	err := a.AddReference(plumbing.NewSymbolicReference("foo", "bar"))
-	c.Assert(err, IsNil)
-	err = a.AddReference(plumbing.NewHashReference("bar", hash))
-	c.Assert(err, IsNil)
+	a := &AdvRefs{}
+	a.Capabilities.Add(capability.SymRef, "foo:bar")
+	a.References = append(a.References, plumbing.NewHashReference("bar", hash))
 
-	refs, err := a.AllReferences()
-	c.Assert(err, IsNil)
+	refs, err := a.ResolvedReferences()
+	s.NoError(err)
 
-	iter, err := refs.IterReferences()
-	c.Assert(err, IsNil)
-
-	var count int
-	iter.ForEach(func(ref *plumbing.Reference) error {
-		count++
+	s.Len(refs, 2)
+	for _, ref := range refs {
 		switch ref.Name() {
 		case "bar":
-			c.Assert(ref.Hash(), Equals, hash)
+			s.Equal(hash, ref.Hash())
 		case "foo":
-			c.Assert(ref.Target().String(), Equals, "bar")
+			s.Equal("bar", ref.Target().String())
 		}
-		return nil
-	})
-
-	c.Assert(count, Equals, 2)
+	}
 }
 
-func (s *AdvRefSuite) TestAllReferencesBadSymref(c *C) {
-	a := NewAdvRefs()
-	err := a.Capabilities.Set(capability.SymRef, "foo")
-	c.Assert(err, IsNil)
+func (s *AdvRefSuite) TestResolvedReferencesBadSymref() {
+	a := &AdvRefs{}
+	a.Capabilities.Set(capability.SymRef, "foo")
 
-	_, err = a.AllReferences()
-	c.Assert(err, NotNil)
+	_, err := a.ResolvedReferences()
+	s.NotNil(err)
 }
 
-func (s *AdvRefSuite) TestIsEmpty(c *C) {
-	a := NewAdvRefs()
-	c.Assert(a.IsEmpty(), Equals, true)
-}
-
-func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToMaster(c *C) {
-	a := NewAdvRefs()
+func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToMaster() {
+	a := &AdvRefs{}
 	headHash := plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c")
-	a.Head = &headHash
+	a.References = append(a.References, plumbing.NewHashReference(plumbing.HEAD, headHash))
 	ref := plumbing.NewHashReference(plumbing.Master, plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
+	a.References = append(a.References, ref)
 
-	err := a.AddReference(ref)
-	c.Assert(err, IsNil)
+	refs, err := a.ResolvedReferences()
+	s.NoError(err)
 
-	storage, err := a.AllReferences()
-	c.Assert(err, IsNil)
-
-	head, err := storage.Reference(plumbing.HEAD)
-	c.Assert(err, IsNil)
-	c.Assert(head.Target(), Equals, ref.Name())
+	head := refByName(refs, plumbing.HEAD)
+	s.NotNil(head)
+	s.Equal(ref.Name(), head.Target())
 }
 
-func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToOtherThanMaster(c *C) {
-	a := NewAdvRefs()
+func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToOtherThanMaster() {
+	a := &AdvRefs{}
 	headHash := plumbing.NewHash("0000000000000000000000000000000000000000")
-	a.Head = &headHash
+	a.References = append(a.References, plumbing.NewHashReference(plumbing.HEAD, headHash))
 	ref1 := plumbing.NewHashReference(plumbing.Master, plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
 	ref2 := plumbing.NewHashReference("other/ref", plumbing.NewHash("0000000000000000000000000000000000000000"))
 
-	err := a.AddReference(ref1)
-	c.Assert(err, IsNil)
-	err = a.AddReference(ref2)
-	c.Assert(err, IsNil)
+	a.References = append(a.References, ref1)
+	a.References = append(a.References, ref2)
 
-	storage, err := a.AllReferences()
-	c.Assert(err, IsNil)
+	refs, err := a.ResolvedReferences()
+	s.NoError(err)
 
-	head, err := storage.Reference(plumbing.HEAD)
-	c.Assert(err, IsNil)
-	c.Assert(head.Hash(), Equals, ref2.Hash())
+	head := refByName(refs, plumbing.HEAD)
+	s.NotNil(head)
+	s.Equal(ref2.Hash().String(), head.Hash().String())
 }
 
-func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToNoRef(c *C) {
-	a := NewAdvRefs()
+func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToNoRef() {
+	a := &AdvRefs{}
 	headHash := plumbing.NewHash("0000000000000000000000000000000000000000")
-	a.Head = &headHash
+	a.References = append(a.References, plumbing.NewHashReference(plumbing.HEAD, headHash))
 	ref := plumbing.NewHashReference(plumbing.Master, plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
+	a.References = append(a.References, ref)
 
-	err := a.AddReference(ref)
-	c.Assert(err, IsNil)
+	refs, err := a.ResolvedReferences()
+	s.NoError(err)
 
-	_, err = a.AllReferences()
-	c.Assert(err, NotNil)
+	head := refByName(refs, plumbing.HEAD)
+	s.NotNil(head)
+	s.Equal(plumbing.HashReference, head.Type())
 }
 
-func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToNoMasterAlphabeticallyOrdered(c *C) {
-	a := NewAdvRefs()
+func (s *AdvRefSuite) TestNoSymRefCapabilityHeadToNoMasterAlphabeticallyOrdered() {
+	a := &AdvRefs{}
 	headHash := plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c")
-	a.Head = &headHash
+	a.References = append(a.References, plumbing.NewHashReference(plumbing.HEAD, headHash))
 	ref1 := plumbing.NewHashReference(plumbing.Master, plumbing.NewHash("0000000000000000000000000000000000000000"))
 	ref2 := plumbing.NewHashReference("aaaaaaaaaaaaaaa", plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
 	ref3 := plumbing.NewHashReference("bbbbbbbbbbbbbbb", plumbing.NewHash("5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c"))
 
-	err := a.AddReference(ref1)
-	c.Assert(err, IsNil)
-	err = a.AddReference(ref3)
-	c.Assert(err, IsNil)
-	err = a.AddReference(ref2)
-	c.Assert(err, IsNil)
+	a.References = append(a.References, ref1)
+	a.References = append(a.References, ref3)
+	a.References = append(a.References, ref2)
 
-	storage, err := a.AllReferences()
-	c.Assert(err, IsNil)
+	refs, err := a.ResolvedReferences()
+	s.NoError(err)
 
-	head, err := storage.Reference(plumbing.HEAD)
-	c.Assert(err, IsNil)
-	c.Assert(head.Target(), Equals, ref2.Name())
+	head := refByName(refs, plumbing.HEAD)
+	s.NotNil(head)
+	s.Equal(plumbing.SymbolicReference, head.Type())
 }
 
-type AdvRefsDecodeEncodeSuite struct{}
+type AdvRefsDecodeEncodeSuite struct {
+	suite.Suite
+}
 
-var _ = Suite(&AdvRefsDecodeEncodeSuite{})
+func TestAdvRefsDecodeEncodeSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(AdvRefsDecodeEncodeSuite))
+}
 
-func (s *AdvRefsDecodeEncodeSuite) test(c *C, in []string, exp []string, isEmpty bool) {
-	var err error
+func (s *AdvRefsDecodeEncodeSuite) test(in, exp []string, isEmpty bool) {
+	s.T().Helper()
+
 	var input io.Reader
+	var isSmart bool
 	{
 		var buf bytes.Buffer
-		p := pktline.NewEncoder(&buf)
-		err = p.EncodeString(in...)
-		c.Assert(err, IsNil)
+		for _, l := range in {
+			if !isSmart && strings.Contains(l, "# service=") {
+				isSmart = true
+			}
+			if l == "" {
+				s.NoError(pktline.WriteFlush(&buf))
+			} else {
+				_, err := pktline.WriteString(&buf, l)
+				s.NoError(err)
+			}
+		}
 		input = &buf
 	}
 
 	var expected []byte
 	{
 		var buf bytes.Buffer
-		p := pktline.NewEncoder(&buf)
-		err = p.EncodeString(exp...)
-		c.Assert(err, IsNil)
+		for _, l := range exp {
+			if l == "" {
+				s.Nil(pktline.WriteFlush(&buf))
+			} else {
+				_, err := pktline.WriteString(&buf, l)
+				s.NoError(err)
+			}
+		}
 
 		expected = buf.Bytes()
 	}
 
 	var obtained []byte
 	{
-		ar := NewAdvRefs()
-		c.Assert(ar.Decode(input), IsNil)
-		c.Assert(ar.IsEmpty(), Equals, isEmpty)
+		var smart SmartReply
+		if isSmart {
+			// Consume the smart service line
+			s.NoError(smart.Decode(input))
+		}
+
+		ar := &AdvRefs{}
+		s.NoError(ar.Decode(input))
+		s.Equal(isEmpty, ar.IsEmpty())
 
 		var buf bytes.Buffer
-		c.Assert(ar.Encode(&buf), IsNil)
+		if isSmart {
+			s.NoError(smart.Encode(&buf))
+		}
+
+		s.NoError(ar.Encode(&buf))
 
 		obtained = buf.Bytes()
 	}
 
-	c.Assert(string(obtained), DeepEquals, string(expected))
+	s.Equal(string(expected), string(obtained))
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestNoHead(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestNoHead() {
 	input := []string{
 		"0000000000000000000000000000000000000000 capabilities^{}\x00",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
 		"0000000000000000000000000000000000000000 capabilities^{}\x00\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, true)
+	s.test(input, expected, true)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestNoHeadSmart(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestNoHeadSmart() {
 	input := []string{
 		"# service=git-upload-pack\n",
+		"",
 		"0000000000000000000000000000000000000000 capabilities^{}\x00",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
 		"# service=git-upload-pack\n",
+		"",
 		"0000000000000000000000000000000000000000 capabilities^{}\x00\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, true)
+	s.test(input, expected, true)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestNoHeadSmartBug(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestNoHeadSmartBug() {
 	input := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"0000000000000000000000000000000000000000 capabilities^{}\x00\n",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"0000000000000000000000000000000000000000 capabilities^{}\x00\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, true)
+	s.test(input, expected, true)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestRefs(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestRefs() {
 	input := []string{
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
 		"7777777777777777777777777777777777777777 refs/tags/v2.6.12-tree",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
@@ -257,13 +262,13 @@ func (s *AdvRefsDecodeEncodeSuite) TestRefs(c *C) {
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
 		"7777777777777777777777777777777777777777 refs/tags/v2.6.12-tree\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, false)
+	s.test(input, expected, false)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestPeeled(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestPeeled() {
 	input := []string{
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack",
 		"7777777777777777777777777777777777777777 refs/tags/v2.6.12-tree\n",
@@ -271,7 +276,7 @@ func (s *AdvRefsDecodeEncodeSuite) TestPeeled(c *C) {
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree",
 		"c39ae07f393806ccf406ef966e9a15afc43cc36a refs/tags/v2.6.11-tree^{}\n",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
@@ -281,13 +286,13 @@ func (s *AdvRefsDecodeEncodeSuite) TestPeeled(c *C) {
 		"c39ae07f393806ccf406ef966e9a15afc43cc36a refs/tags/v2.6.11-tree^{}\n",
 		"7777777777777777777777777777777777777777 refs/tags/v2.6.12-tree\n",
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, false)
+	s.test(input, expected, false)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestAll(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestAll() {
 	input := []string{
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack\n",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
@@ -297,7 +302,7 @@ func (s *AdvRefsDecodeEncodeSuite) TestAll(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}",
 		"shallow 1111111111111111111111111111111111111111",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
@@ -309,16 +314,16 @@ func (s *AdvRefsDecodeEncodeSuite) TestAll(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
 		"shallow 1111111111111111111111111111111111111111\n",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, false)
+	s.test(input, expected, false)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestAllSmart(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestAllSmart() {
 	input := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack\n",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
@@ -327,12 +332,12 @@ func (s *AdvRefsDecodeEncodeSuite) TestAllSmart(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
 		"shallow 1111111111111111111111111111111111111111\n",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack\n",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
@@ -341,16 +346,16 @@ func (s *AdvRefsDecodeEncodeSuite) TestAllSmart(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
 		"shallow 1111111111111111111111111111111111111111\n",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, false)
+	s.test(input, expected, false)
 }
 
-func (s *AdvRefsDecodeEncodeSuite) TestAllSmartBug(c *C) {
+func (s *AdvRefsDecodeEncodeSuite) TestAllSmartBug() {
 	input := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack\n",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
@@ -359,12 +364,12 @@ func (s *AdvRefsDecodeEncodeSuite) TestAllSmartBug(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
 		"shallow 1111111111111111111111111111111111111111\n",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
 	expected := []string{
 		"# service=git-upload-pack\n",
-		pktline.FlushString,
+		"",
 		"6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD\x00symref=HEAD:/refs/heads/master ofs-delta multi_ack\n",
 		"a6930aaee06755d1bdcfd943fbf614e4d92bb0c7 refs/heads/master\n",
 		"5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11-tree\n",
@@ -373,8 +378,8 @@ func (s *AdvRefsDecodeEncodeSuite) TestAllSmartBug(c *C) {
 		"8888888888888888888888888888888888888888 refs/tags/v2.6.12-tree^{}\n",
 		"shallow 1111111111111111111111111111111111111111\n",
 		"shallow 2222222222222222222222222222222222222222\n",
-		pktline.FlushString,
+		"",
 	}
 
-	s.test(c, input, expected, false)
+	s.test(input, expected, false)
 }

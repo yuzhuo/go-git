@@ -7,8 +7,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/utils/binary"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/utils/binary"
 )
 
 // objects implements sort.Interface and uses hash as sorting key.
@@ -43,6 +43,11 @@ func (w *Writer) Index() (*MemoryIndex, error) {
 
 // Add appends new object data.
 func (w *Writer) Add(h plumbing.Hash, pos uint64, crc uint32) {
+	// Skip unmaterialised delta objects.
+	if h.IsZero() {
+		return
+	}
+
 	w.m.Lock()
 	defer w.m.Unlock()
 
@@ -54,9 +59,9 @@ func (w *Writer) Add(h plumbing.Hash, pos uint64, crc uint32) {
 		w.added[h] = struct{}{}
 		w.objects = append(w.objects, Entry{h, crc, pos})
 	}
-
 }
 
+// Finished returns true if the writer has finished writing.
 func (w *Writer) Finished() bool {
 	return w.finished
 }
@@ -69,7 +74,7 @@ func (w *Writer) OnHeader(count uint32) error {
 }
 
 // OnInflatedObjectHeader implements packfile.Observer interface.
-func (w *Writer) OnInflatedObjectHeader(t plumbing.ObjectType, objSize int64, pos int64) error {
+func (w *Writer) OnInflatedObjectHeader(_ plumbing.ObjectType, _, _ int64) error {
 	return nil
 }
 
@@ -84,11 +89,8 @@ func (w *Writer) OnFooter(h plumbing.Hash) error {
 	w.checksum = h
 	w.finished = true
 	_, err := w.createIndex()
-	if err != nil {
-		return err
-	}
 
-	return nil
+	return err
 }
 
 // creatIndex returns a filled MemoryIndex with the information filled by
@@ -98,7 +100,7 @@ func (w *Writer) createIndex() (*MemoryIndex, error) {
 		return nil, fmt.Errorf("the index still hasn't finished building")
 	}
 
-	idx := new(MemoryIndex)
+	idx := NewMemoryIndex(w.checksum.Size())
 	w.index = idx
 
 	sort.Sort(w.objects)
@@ -108,12 +110,22 @@ func (w *Writer) createIndex() (*MemoryIndex, error) {
 		idx.FanoutMapping[i] = noMapping
 	}
 
+	// Pre-allocate underlying array based on expected number
+	// of objects.
+	idx.Names = make([][]byte, 0, len(w.objects))
+	idx.Offset32 = make([][]byte, 0, len(w.objects))
+	idx.CRC32 = make([][]byte, 0, len(w.objects))
+
 	buf := new(bytes.Buffer)
 
 	last := -1
 	bucket := -1
 	for i, o := range w.objects {
-		fan := o.Hash[0]
+		if o.Hash.Size() != w.checksum.Size() {
+			return nil, fmt.Errorf("object hash size mismatch: %d instead of %d", o.Hash.Size(), w.checksum.Size())
+		}
+
+		fan := o.Hash.Bytes()[0]
 
 		// fill the gaps between fans
 		for j := last + 1; j < int(fan); j++ {
@@ -135,19 +147,27 @@ func (w *Writer) createIndex() (*MemoryIndex, error) {
 			idx.CRC32 = append(idx.CRC32, make([]byte, 0))
 		}
 
-		idx.Names[bucket] = append(idx.Names[bucket], o.Hash[:]...)
+		idx.Names[bucket] = append(idx.Names[bucket], o.Hash.Bytes()...)
 
 		offset := o.Offset
 		if offset > math.MaxInt32 {
-			offset = w.addOffset64(offset)
+			var err error
+			offset, err = w.addOffset64(offset)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		buf.Truncate(0)
-		binary.WriteUint32(buf, uint32(offset))
+		if err := binary.WriteUint32(buf, uint32(offset)); err != nil {
+			return nil, err
+		}
 		idx.Offset32[bucket] = append(idx.Offset32[bucket], buf.Bytes()...)
 
 		buf.Truncate(0)
-		binary.WriteUint32(buf, o.CRC32)
+		if err := binary.WriteUint32(buf, o.CRC32); err != nil {
+			return nil, err
+		}
 		idx.CRC32[bucket] = append(idx.CRC32[bucket], buf.Bytes()...)
 	}
 
@@ -161,26 +181,28 @@ func (w *Writer) createIndex() (*MemoryIndex, error) {
 	return idx, nil
 }
 
-func (w *Writer) addOffset64(pos uint64) uint64 {
+func (w *Writer) addOffset64(pos uint64) (uint64, error) {
 	buf := new(bytes.Buffer)
-	binary.WriteUint64(buf, pos)
-	w.index.Offset64 = append(w.index.Offset64, buf.Bytes()...)
+	if err := binary.WriteUint64(buf, pos); err != nil {
+		return 0, err
+	}
 
+	w.index.Offset64 = append(w.index.Offset64, buf.Bytes()...)
 	index := uint64(w.offset64 | (1 << 31))
 	w.offset64++
 
-	return index
+	return index, nil
 }
 
 func (o objects) Len() int {
 	return len(o)
 }
 
-func (o objects) Less(i int, j int) bool {
-	cmp := bytes.Compare(o[i].Hash[:], o[j].Hash[:])
+func (o objects) Less(i, j int) bool {
+	cmp := o[i].Hash.Compare(o[j].Hash.Bytes())
 	return cmp < 0
 }
 
-func (o objects) Swap(i int, j int) {
+func (o objects) Swap(i, j int) {
 	o[i], o[j] = o[j], o[i]
 }

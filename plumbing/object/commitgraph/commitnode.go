@@ -1,12 +1,13 @@
 package commitgraph
 
 import (
+	"errors"
 	"io"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 // CommitNode is generic interface encapsulating a lightweight commit object retrieved
@@ -16,7 +17,7 @@ type CommitNode interface {
 	ID() plumbing.Hash
 	// Tree returns the Tree referenced by the commit graph node.
 	Tree() (*object.Tree, error)
-	// CommitTime returns the Commiter.When time of the Commit referenced by the commit graph node.
+	// CommitTime returns the Committer.When time of the Commit referenced by the commit graph node.
 	CommitTime() time.Time
 	// NumParents returns the number of parents in a commit.
 	NumParents() int
@@ -29,6 +30,10 @@ type CommitNode interface {
 	// Generation returns the generation of the commit for reachability analysis.
 	// Objects with newer generation are not reachable from objects of older generation.
 	Generation() uint64
+	// GenerationV2 stores the corrected commit date for the commits
+	// It combines the contents of the GDA2 and GDO2 sections of the commit-graph
+	// with the commit time portion of the CDAT section.
+	GenerationV2() uint64
 	// Commit returns the full commit object from the node
 	Commit() (*object.Commit, error)
 }
@@ -60,7 +65,7 @@ func newParentgraphCommitNodeIter(node CommitNode) CommitNodeIter {
 // there are no more commits, it returns io.EOF.
 func (iter *parentCommitNodeIter) Next() (CommitNode, error) {
 	obj, err := iter.node.ParentNode(iter.i)
-	if err == object.ErrParentNotFound {
+	if errors.Is(err, object.ErrParentNotFound) {
 		return nil, io.EOF
 	}
 	if err == nil {
@@ -85,7 +90,7 @@ func (iter *parentCommitNodeIter) ForEach(cb func(CommitNode) error) error {
 		}
 
 		if err := cb(obj); err != nil {
-			if err == storer.ErrStop {
+			if errors.Is(err, storer.ErrStop) {
 				return nil
 			}
 

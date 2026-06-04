@@ -4,68 +4,60 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
-)
-
-var (
-	zeroHashString = plumbing.ZeroHash.String()
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 )
 
 // Encode writes the ReferenceUpdateRequest encoding to the stream.
-func (req *ReferenceUpdateRequest) Encode(w io.Writer) error {
-	if err := req.validate(); err != nil {
+func (req *UpdateRequests) Encode(w io.Writer) error {
+	if err := validateUpdateRequests(req); err != nil {
 		return err
 	}
 
-	e := pktline.NewEncoder(w)
-
-	if err := req.encodeShallow(e, req.Shallow); err != nil {
+	if err := req.encodeShallow(w); err != nil {
 		return err
 	}
 
-	if err := req.encodeCommands(e, req.Commands, req.Capabilities); err != nil {
+	if err := req.encodeCommands(w, req.Commands, &req.Capabilities); err != nil {
 		return err
-	}
-
-	if req.Packfile != nil {
-		if _, err := io.Copy(w, req.Packfile); err != nil {
-			return err
-		}
-
-		return req.Packfile.Close()
 	}
 
 	return nil
 }
 
-func (req *ReferenceUpdateRequest) encodeShallow(e *pktline.Encoder,
-	h *plumbing.Hash) error {
-
-	if h == nil {
-		return nil
-	}
-
-	objId := []byte(h.String())
-	return e.Encodef("%s%s", shallow, objId)
-}
-
-func (req *ReferenceUpdateRequest) encodeCommands(e *pktline.Encoder,
-	cmds []*Command, cap *capability.List) error {
-
-	if err := e.Encodef("%s\x00%s",
-		formatCommand(cmds[0]), cap.String()); err != nil {
-		return err
-	}
-
-	for _, cmd := range cmds[1:] {
-		if err := e.Encodef(formatCommand(cmd)); err != nil {
+func (req *UpdateRequests) encodeShallow(w io.Writer) error {
+	for _, h := range req.Shallows {
+		objID := []byte(h.String())
+		_, err := pktline.Writef(w, "%s%s", shallow, objID)
+		if err != nil {
 			return err
 		}
 	}
 
-	return e.Flush()
+	return nil
+}
+
+func (req *UpdateRequests) encodeCommands(w io.Writer,
+	cmds []*Command, caps *capability.List,
+) error {
+	capStr := caps.String()
+	if len(capStr) > 0 {
+		// Canonical Git adds a space before the capabilities.
+		// See https://github.com/git/git/blob/57da342c786f59eaeb436c18635cc1c7597733d9/send-pack.c#L594
+		capStr = " " + capStr
+	}
+	if _, err := pktline.Writef(w, "%s\x00%s",
+		formatCommand(cmds[0]), capStr); err != nil {
+		return err
+	}
+
+	for _, cmd := range cmds[1:] {
+		if _, err := pktline.Write(w, []byte(formatCommand(cmd))); err != nil {
+			return err
+		}
+	}
+
+	return pktline.WriteFlush(w)
 }
 
 func formatCommand(cmd *Command) string {

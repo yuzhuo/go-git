@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 
-	"github.com/go-git/go-billy/v5/osfs"
-	"github.com/go-git/go-git/v5/internal/url"
-	format "github.com/go-git/go-git/v5/plumbing/format/config"
-	"github.com/mitchellh/go-homedir"
+	"github.com/go-git/go-billy/v6/osfs"
+
+	"github.com/go-git/go-git/v6/internal/url"
+	"github.com/go-git/go-git/v6/plumbing"
+	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/protocol"
 )
 
 const (
@@ -23,18 +26,28 @@ const (
 	DefaultFetchRefSpec = "+refs/heads/*:refs/remotes/%s/*"
 	// DefaultPushRefSpec is the default refspec used for push.
 	DefaultPushRefSpec = "refs/heads/*:refs/heads/*"
+	// DefaultProtocolVersion is the value assumed if none is defined
+	// at the config file. This value is used to define when this section
+	// should be marshalled or not.
+	// Note that this does not need to align with the default protocol
+	// version from plumbing/protocol.
+	DefaultProtocolVersion = protocol.V0 // go-git only supports V0 at the moment
 )
 
-// ConfigStorer generic storage of Config object
-type ConfigStorer interface {
+// ConfigStorer is a generic storage of Config object.
+type ConfigStorer interface { //nolint:revive // stutters but is a well-established name
 	Config() (*Config, error)
 	SetConfig(*Config) error
 }
 
 var (
-	ErrInvalid               = errors.New("config invalid key in remote or branch")
-	ErrRemoteConfigNotFound  = errors.New("remote config not found")
-	ErrRemoteConfigEmptyURL  = errors.New("remote config: empty URL")
+	// ErrInvalid is returned when a config key is invalid.
+	ErrInvalid = errors.New("config invalid key in remote or branch")
+	// ErrRemoteConfigNotFound is returned when a remote config is not found.
+	ErrRemoteConfigNotFound = errors.New("remote config not found")
+	// ErrRemoteConfigEmptyURL is returned when a remote config has an empty URL.
+	ErrRemoteConfigEmptyURL = errors.New("remote config: empty URL")
+	// ErrRemoteConfigEmptyName is returned when a remote config has an empty name.
 	ErrRemoteConfigEmptyName = errors.New("remote config: empty name")
 )
 
@@ -60,14 +73,32 @@ type Config struct {
 		// CommentChar is the character indicating the start of a
 		// comment for commands like commit and tag
 		CommentChar string
+		// RepositoryFormatVersion identifies the repository format and layout version.
+		RepositoryFormatVersion format.RepositoryFormatVersion
+		// AutoCRLF if "true", all the CRLF line endings in the worktree will be
+		// converted to LF when added to the repository, and vice versa on checkout.
+		// If set to "input", only worktree-to-repository conversion is performed.
+		AutoCRLF string
+		// FileMode defines whether the executable bit of working tree files is to be honored.
+		// If "false", when an index node is an Executable and is comparing hash
+		// against local file, 0644 will be used as the value of its mode. The original
+		// value of mode is left unchanged in the index.
+		FileMode bool
+		// HooksPath is the path to look for hooks instead of $GIT_DIR/hooks.
+		HooksPath string
+		// ProtectNTFS controls whether NTFS-specific path protections are
+		// applied (e.g. rejecting .git trailing spaces/periods, alternate
+		// data streams, 8.3 short names). When unset, defaults to true on
+		// Windows.
+		ProtectNTFS OptBool
+		// ProtectHFS controls whether HFS+-specific path protections are
+		// applied (e.g. rejecting .git with Unicode zero-width or
+		// directional characters that HFS+ would normalize away).
+		// When unset, defaults to true on macOS.
+		ProtectHFS OptBool
 	}
 
-	User struct {
-		// Name is the personal name of the author and the commiter of a commit.
-		Name string
-		// Email is the email of the author and the commiter of a commit.
-		Email string
-	}
+	User user
 
 	Author struct {
 		// Name is the personal name of the author of a commit.
@@ -77,10 +108,31 @@ type Config struct {
 	}
 
 	Committer struct {
-		// Name is the personal name of the commiter of a commit.
+		// Name is the personal name of the committer of a commit.
 		Name string
-		// Email is the email of the  the commiter of a commit.
+		// Email is the email of the committer of a commit.
 		Email string
+	}
+
+	Tag struct {
+		// GpgSign indicates whether all new tags should be GPG signed.
+		GpgSign OptBool
+	}
+
+	Commit struct {
+		// GpgSign indicates whether all new commits should be GPG signed.
+		GpgSign OptBool
+	}
+
+	GPG struct {
+		// Format specifies the signature format to use when signing commits and tags.
+		// Valid values are "openpgp" (default), "x509" and "ssh".
+		Format string
+		// SSH contains SSH-specific GPG configuration.
+		SSH struct {
+			// AllowedSignersFile is the path to the file containing allowed SSH signing keys.
+			AllowedSignersFile string
+		}
 	}
 
 	Pack struct {
@@ -88,6 +140,21 @@ type Config struct {
 		// compression.  The default is 10.  A value of 0 turns off
 		// delta compression entirely.
 		Window uint
+		// ReadReverseIndex controls whether Git reads .rev files from
+		// disk. When false, a reverse index is generated in memory on
+		// demand instead. Defaults to true.
+		ReadReverseIndex bool
+		// WriteReverseIndex controls whether Git writes .rev files
+		// when creating new packfiles. Defaults to true.
+		WriteReverseIndex bool
+	}
+
+	Index struct {
+		// SkipHash if true, the index checksum is not written or verified.
+		// This corresponds to git's index.skipHash configuration (git 2.40+),
+		// which skips the trailing SHA-1/SHA-256 computation for performance
+		// on large repositories.
+		SkipHash OptBool
 	}
 
 	Init struct {
@@ -95,6 +162,42 @@ type Config struct {
 		// e.g. when initializing a new repository or when cloning
 		// an empty repository.
 		DefaultBranch string
+	}
+
+	UploadArchive struct {
+		// AllowUnreachable when true allows clients to request archives
+		// using arbitrary SHA-1 expressions. When false (the default),
+		// only direct ref names are allowed.
+		AllowUnreachable OptBool
+	}
+
+	Extensions struct {
+		// ObjectFormat specifies the hash algorithm to use. The
+		// acceptable values are sha1 and sha256. If not specified,
+		// sha1 is assumed. It is an error to specify this key unless
+		// core.repositoryFormatVersion is 1.
+		//
+		// This setting must not be changed after repository initialization
+		// (e.g. clone or init).
+		ObjectFormat format.ObjectFormat
+		// WorktreeConfig indicates that per-worktree config files are enabled.
+		// When true, each worktree may have a config.worktree file that
+		// overrides settings in the common .git/config.
+		WorktreeConfig bool
+	}
+
+	Protocol struct {
+		// Version sets the preferred version for the Git wire protocol.
+		// When set, clients will attempt to communicate with a server
+		// using the specified protocol version. If the server does not
+		// support it, communication falls back to version 0. If unset,
+		// the default version will be used. Supported versions:
+		//
+		//   0 - the original wire protocol.
+		//   1 - the original wire protocol with the addition of a
+		// version string in the initial response from the server.
+		//   2 - Wire protocol version 2.
+		Version protocol.Version
 	}
 
 	// Remotes list of repository remotes, the key of the map is the name
@@ -115,6 +218,108 @@ type Config struct {
 	Raw *format.Config
 }
 
+type user struct {
+	// Name is the personal name of the author and the committer of a commit.
+	Name string
+	// Email is the email of the author and the committer of a commit.
+	Email string
+
+	// SigningKey defines what key should be used when automatically
+	// signing tags or commits, and more than one key is available.
+	//
+	// If gpg.format is set to ssh this can contain the path to either
+	// your private ssh key or the public key when ssh-agent is used.
+	// Alternatively it can contain a public key prefixed with key::
+	// directly (e.g.: "key::ssh-rsa XXXXXX identifier"). The private
+	// key needs to be available via ssh-agent.
+	//
+	// If not set go-git will use the first key available.
+	SigningKey string
+}
+
+// Merge combines all the src Config objects into one.
+// The objects are processed in the order they are passed on, and will
+// override any existing values. Empty configs are ignored.
+//
+// The config field Raw cannot be merged via reflection, so it is ignored
+// as part of the Merge operation. To update Raw after a merge, call Marshal().
+func Merge(src ...*Config) Config {
+	var final Config
+
+	for _, c := range src {
+		if c == nil {
+			continue
+		}
+
+		merge(&final, c)
+	}
+
+	return final
+}
+
+func merge(dst, src any) {
+	tv := reflect.ValueOf(dst).Elem()
+	sv := reflect.ValueOf(src).Elem()
+	tt := tv.Type()
+
+	for i := 0; i < tv.NumField(); i++ {
+		// Raw holds a *format.Config whose Sections field is a slice. The
+		// generic default case below would replace dst.Sections with
+		// src.Sections wholesale, dropping sections that exist only in the
+		// base config (e.g. [extensions]).  Merge() rebuilds Raw from the
+		// merged struct state after all sources have been processed, so we
+		// skip it here.
+		if tt.Field(i).Name == "Raw" {
+			continue
+		}
+
+		df := tv.Field(i)
+		sf := sv.Field(i)
+
+		if !df.CanSet() || sf.IsZero() {
+			continue
+		}
+
+		switch df.Kind() {
+		case reflect.Struct:
+			// Handle nested fields which are based off structs.
+			merge(df.Addr().Interface(), sf.Addr().Interface())
+
+		case reflect.Pointer:
+			if sf.IsNil() {
+				continue
+			}
+			if df.IsNil() {
+				df.Set(reflect.New(df.Type().Elem()))
+			}
+			// Same as per reflect.Struct, but for a struct pointer.
+			if df.Elem().Kind() == reflect.Struct {
+				merge(df.Interface(), sf.Interface())
+			} else {
+				df.Set(sf)
+			}
+
+		case reflect.Map:
+			// An empty (but non-nil) src map must not overwrite dst entries.
+			// Only copy individual entries from src so that dst keys not
+			// present in src are preserved and src entries override same-key
+			// dst entries.
+			if sf.Len() == 0 {
+				continue
+			}
+			if df.IsNil() {
+				df.Set(reflect.MakeMap(df.Type()))
+			}
+			for _, key := range sf.MapKeys() {
+				df.SetMapIndex(key, sf.MapIndex(key))
+			}
+
+		default:
+			df.Set(sf)
+		}
+	}
+}
+
 // NewConfig returns a new empty Config.
 func NewConfig() *Config {
 	config := &Config{
@@ -125,14 +330,18 @@ func NewConfig() *Config {
 		Raw:        format.New(),
 	}
 
+	config.Core.FileMode = DefaultFileMode
 	config.Pack.Window = DefaultPackWindow
+	config.Pack.ReadReverseIndex = true
+	config.Pack.WriteReverseIndex = true
+	config.Protocol.Version = DefaultProtocolVersion
 
 	return config
 }
 
 // ReadConfig reads a config file from a io.Reader.
 func ReadConfig(r io.Reader) (*Config, error) {
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -145,12 +354,12 @@ func ReadConfig(r io.Reader) (*Config, error) {
 	return cfg, nil
 }
 
-// LoadConfig loads a config file from a given scope. The returned Config,
-// contains exclusively information fom the given scope. If couldn't find a
-// config file to the given scope, a empty one is returned.
+// LoadConfig loads a config file from a given scope.
+//
+// Deprecated: Use the ConfigLoader plugin instead. This will be removed in v7.
 func LoadConfig(scope Scope) (*Config, error) {
 	if scope == LocalScope {
-		return nil, fmt.Errorf("LocalScope should be read from the a ConfigStorer.")
+		return nil, fmt.Errorf("LocalScope should be read from the a ConfigStorer")
 	}
 
 	files, err := Paths(scope)
@@ -168,7 +377,7 @@ func LoadConfig(scope Scope) (*Config, error) {
 			return nil, err
 		}
 
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		return ReadConfig(f)
 	}
 
@@ -176,6 +385,9 @@ func LoadConfig(scope Scope) (*Config, error) {
 }
 
 // Paths returns the config file location for a given scope.
+//
+// Deprecated: Use the ConfigLoader plugin instead.
+// This will be removed in v7.
 func Paths(scope Scope) ([]string, error) {
 	var files []string
 	switch scope {
@@ -185,7 +397,7 @@ func Paths(scope Scope) ([]string, error) {
 			files = append(files, filepath.Join(xdg, "git/config"))
 		}
 
-		home, err := homedir.Dir()
+		home, err := os.UserHomeDir()
 		if err != nil {
 			return nil, err
 		}
@@ -227,31 +439,60 @@ func (c *Config) Validate() error {
 }
 
 const (
-	remoteSection    = "remote"
-	submoduleSection = "submodule"
-	branchSection    = "branch"
-	coreSection      = "core"
-	packSection      = "pack"
-	userSection      = "user"
-	authorSection    = "author"
-	committerSection = "committer"
-	initSection      = "init"
-	urlSection       = "url"
-	fetchKey         = "fetch"
-	urlKey           = "url"
-	bareKey          = "bare"
-	worktreeKey      = "worktree"
-	commentCharKey   = "commentChar"
-	windowKey        = "window"
-	mergeKey         = "merge"
-	rebaseKey        = "rebase"
-	nameKey          = "name"
-	emailKey         = "email"
-	defaultBranchKey = "defaultBranch"
+	remoteSection              = "remote"
+	submoduleSection           = "submodule"
+	branchSection              = "branch"
+	coreSection                = "core"
+	packSection                = "pack"
+	userSection                = "user"
+	tagSection                 = "tag"
+	commitSection              = "commit"
+	authorSection              = "author"
+	committerSection           = "committer"
+	gpgSection                 = "gpg"
+	initSection                = "init"
+	urlSection                 = "url"
+	extensionsSection          = "extensions"
+	protocolSection            = "protocol"
+	fetchKey                   = "fetch"
+	urlKey                     = "url"
+	pushurlKey                 = "pushurl"
+	bareKey                    = "bare"
+	worktreeKey                = "worktree"
+	commentCharKey             = "commentChar"
+	windowKey                  = "window"
+	readReverseIndexKey        = "readReverseIndex"
+	writeReverseIndexKey       = "writeReverseIndex"
+	mergeKey                   = "merge"
+	rebaseKey                  = "rebase"
+	nameKey                    = "name"
+	emailKey                   = "email"
+	signingKey                 = "signingKey"
+	descriptionKey             = "description"
+	defaultBranchKey           = "defaultBranch"
+	repositoryFormatVersionKey = "repositoryformatversion"
+	objectFormatKey            = "objectformat"
+	worktreeConfigKey          = "worktreeConfig"
+	mirrorKey                  = "mirror"
+	versionKey                 = "version"
+	autoCRLFKey                = "autocrlf"
+	fileModeKey                = "filemode"
+	hooksPathKey               = "hooksPath"
+	protectNTFSKey             = "protectNTFS"
+	protectHFSKey              = "protectHFS"
+	indexSection               = "index"
+	skipHashKey                = "skipHash"
+	formatKey                  = "format"
+	allowedSignersFileKey      = "allowedSignersFile"
+	gpgSignKey                 = "gpgSign"
+	uploadArchiveSection       = "uploadArchive"
+	allowUnreachableKey        = "allowUnreachable"
 
 	// DefaultPackWindow holds the number of previous objects used to
 	// generate deltas. The value 10 is the same used by git command.
 	DefaultPackWindow = uint(10)
+	// DefaultFileMode is the default file mode used by git command.
+	DefaultFileMode = true
 )
 
 // Unmarshal parses a git-config file and stores it.
@@ -265,8 +506,14 @@ func (c *Config) Unmarshal(b []byte) error {
 	}
 
 	c.unmarshalCore()
+	c.unmarshalExtensions()
+	c.unmarshalIndex()
+	c.unmarshalTag()
+	c.unmarshalCommit()
 	c.unmarshalUser()
+	c.unmarshalGPG()
 	c.unmarshalInit()
+	c.unmarshalUploadArchive()
 	if err := c.unmarshalPack(); err != nil {
 		return err
 	}
@@ -277,6 +524,10 @@ func (c *Config) Unmarshal(b []byte) error {
 	}
 
 	if err := c.unmarshalURLs(); err != nil {
+		return err
+	}
+
+	if err := c.unmarshalProtocol(); err != nil {
 		return err
 	}
 
@@ -291,12 +542,53 @@ func (c *Config) unmarshalCore() {
 
 	c.Core.Worktree = s.Options.Get(worktreeKey)
 	c.Core.CommentChar = s.Options.Get(commentCharKey)
+	c.Core.AutoCRLF = s.Options.Get(autoCRLFKey)
+	c.Core.HooksPath = s.Options.Get(hooksPathKey)
+
+	if parsed := parseConfigBool(s.Options.Get(protectNTFSKey)); parsed.IsSet() {
+		c.Core.ProtectNTFS = parsed
+	}
+
+	if parsed := parseConfigBool(s.Options.Get(protectHFSKey)); parsed.IsSet() {
+		c.Core.ProtectHFS = parsed
+	}
+
+	if fileMode := s.Options.Get(fileModeKey); fileMode == "false" {
+		c.Core.FileMode = false
+	}
+
+	if s.Options.Get(repositoryFormatVersionKey) == string(format.Version1) {
+		c.Core.RepositoryFormatVersion = format.Version1
+	}
+}
+
+func (c *Config) unmarshalExtensions() {
+	s := c.Raw.Section(extensionsSection)
+	c.Extensions.ObjectFormat = format.ObjectFormat(s.Options.Get(objectFormatKey))
+	c.Extensions.WorktreeConfig = strings.EqualFold(s.Options.Get(worktreeConfigKey), "true")
+}
+
+func (c *Config) unmarshalTag() {
+	s := c.Raw.Section(tagSection)
+	v, err := strconv.ParseBool(s.Options.Get(gpgSignKey))
+	if err == nil {
+		c.Tag.GpgSign = NewOptBool(v)
+	}
+}
+
+func (c *Config) unmarshalCommit() {
+	s := c.Raw.Section(commitSection)
+	v, err := strconv.ParseBool(s.Options.Get(gpgSignKey))
+	if err == nil {
+		c.Commit.GpgSign = NewOptBool(v)
+	}
 }
 
 func (c *Config) unmarshalUser() {
 	s := c.Raw.Section(userSection)
 	c.User.Name = s.Options.Get(nameKey)
 	c.User.Email = s.Options.Get(emailKey)
+	c.User.SigningKey = s.Options.Get(signingKey)
 
 	s = c.Raw.Section(authorSection)
 	c.Author.Name = s.Options.Get(nameKey)
@@ -305,6 +597,18 @@ func (c *Config) unmarshalUser() {
 	s = c.Raw.Section(committerSection)
 	c.Committer.Name = s.Options.Get(nameKey)
 	c.Committer.Email = s.Options.Get(emailKey)
+}
+
+func (c *Config) unmarshalGPG() {
+	s := c.Raw.Section(gpgSection)
+	c.GPG.Format = s.Options.Get(formatKey)
+
+	// SSH subsection is parsed separately since it uses subsections
+	for _, sub := range s.Subsections {
+		if sub.Name == "ssh" {
+			c.GPG.SSH.AllowedSignersFile = sub.Options.Get(allowedSignersFileKey)
+		}
+	}
 }
 
 func (c *Config) unmarshalPack() error {
@@ -319,6 +623,10 @@ func (c *Config) unmarshalPack() error {
 		}
 		c.Pack.Window = uint(winUint)
 	}
+
+	c.Pack.ReadReverseIndex = s.Options.Get(readReverseIndexKey) != "false"
+	c.Pack.WriteReverseIndex = s.Options.Get(writeReverseIndexKey) != "false"
+
 	return nil
 }
 
@@ -333,6 +641,21 @@ func (c *Config) unmarshalRemotes() error {
 		c.Remotes[r.Name] = r
 	}
 
+	// Check if the main remote section still has options
+	// after unmarshaling named subsections - this indicates an empty subsection name
+	if len(s.Options) > 0 {
+		emptySubsection := &format.Subsection{
+			Name:    "",
+			Options: s.Options,
+		}
+
+		r := &RemoteConfig{}
+		if err := r.unmarshal(emptySubsection); err != nil {
+			return err
+		}
+
+		c.Remotes[r.Name] = r
+	}
 	// Apply insteadOf url rules
 	for _, r := range c.Remotes {
 		r.applyURLRules(c.URLs)
@@ -361,7 +684,8 @@ func unmarshalSubmodules(fc *format.Config, submodules map[string]*Submodule) {
 		m := &Submodule{}
 		m.unmarshal(sub)
 
-		if m.Validate() == ErrModuleBadPath {
+		if err := m.Validate(); errors.Is(err, ErrModuleBadPath) ||
+			errors.Is(err, ErrModuleBadName) {
 			continue
 		}
 
@@ -383,21 +707,69 @@ func (c *Config) unmarshalBranches() error {
 	return nil
 }
 
+func (c *Config) unmarshalProtocol() error {
+	s := c.Raw.Section(protocolSection)
+
+	c.Protocol.Version = DefaultProtocolVersion
+
+	// If empty, don't try to parse and instead fallback
+	// to default protocol version.
+	if rv := s.Options.Get(versionKey); rv != "" {
+		v, err := protocol.Parse(rv)
+		if err != nil {
+			return err
+		}
+		c.Protocol.Version = v
+	}
+
+	return nil
+}
+
+func (c *Config) unmarshalIndex() {
+	s := c.Raw.Section(indexSection)
+	v, err := strconv.ParseBool(s.Options.Get(skipHashKey))
+	if err == nil {
+		c.Index.SkipHash = NewOptBool(v)
+	}
+}
+
 func (c *Config) unmarshalInit() {
 	s := c.Raw.Section(initSection)
 	c.Init.DefaultBranch = s.Options.Get(defaultBranchKey)
 }
 
+func (c *Config) unmarshalUploadArchive() {
+	s := c.Raw.Section(uploadArchiveSection)
+	v, err := strconv.ParseBool(s.Options.Get(allowUnreachableKey))
+	if err == nil {
+		c.UploadArchive.AllowUnreachable = NewOptBool(v)
+	}
+}
+
 // Marshal returns Config encoded as a git-config file.
+//
+// This call populates the field Raw with the current values of
+// the config.
 func (c *Config) Marshal() ([]byte, error) {
+	if c.Raw == nil {
+		c.Raw = format.New()
+	}
+
 	c.marshalCore()
+	c.marshalExtensions()
+	c.marshalIndex()
+	c.marshalTag()
+	c.marshalCommit()
 	c.marshalUser()
+	c.marshalGPG()
 	c.marshalPack()
 	c.marshalRemotes()
 	c.marshalSubmodules()
 	c.marshalBranches()
 	c.marshalURLs()
+	c.marshalProtocol()
 	c.marshalInit()
+	c.marshalUploadArchive()
 
 	buf := bytes.NewBuffer(nil)
 	if err := format.NewEncoder(buf).Encode(c.Raw); err != nil {
@@ -410,9 +782,68 @@ func (c *Config) Marshal() ([]byte, error) {
 func (c *Config) marshalCore() {
 	s := c.Raw.Section(coreSection)
 	s.SetOption(bareKey, fmt.Sprintf("%t", c.Core.IsBare))
+	if string(c.Core.RepositoryFormatVersion) != "" {
+		s.SetOption(repositoryFormatVersionKey, string(c.Core.RepositoryFormatVersion))
+	}
 
 	if c.Core.Worktree != "" {
 		s.SetOption(worktreeKey, c.Core.Worktree)
+	}
+
+	if c.Core.AutoCRLF != "" {
+		s.SetOption(autoCRLFKey, c.Core.AutoCRLF)
+	}
+
+	s.SetOption(fileModeKey, fmt.Sprintf("%t", c.Core.FileMode))
+
+	if c.Core.HooksPath != "" {
+		s.SetOption(hooksPathKey, c.Core.HooksPath)
+	}
+
+	if c.Core.ProtectNTFS.IsSet() {
+		s.SetOption(protectNTFSKey, c.Core.ProtectNTFS.FormatBool())
+	}
+
+	if c.Core.ProtectHFS.IsSet() {
+		s.SetOption(protectHFSKey, c.Core.ProtectHFS.FormatBool())
+	}
+}
+
+func (c *Config) marshalExtensions() {
+	// Extensions are only supported on Version 1, therefore
+	// don't marshal it otherwise.
+	if c.Core.RepositoryFormatVersion != format.Version1 {
+		return
+	}
+
+	// Only marshal the [extensions] section if there are extension options to write.
+	// This avoids introducing an empty [extensions] section on round-trips.
+	if c.Extensions.ObjectFormat == format.UnsetObjectFormat &&
+		!c.Extensions.WorktreeConfig {
+		return
+	}
+
+	s := c.Raw.Section(extensionsSection)
+	if c.Extensions.ObjectFormat != format.UnsetObjectFormat {
+		s.SetOption(objectFormatKey, string(c.Extensions.ObjectFormat))
+	}
+
+	if c.Extensions.WorktreeConfig {
+		s.SetOption(worktreeConfigKey, "true")
+	}
+}
+
+func (c *Config) marshalTag() {
+	s := c.Raw.Section(tagSection)
+	if c.Tag.GpgSign.IsSet() {
+		s.SetOption(gpgSignKey, c.Tag.GpgSign.FormatBool())
+	}
+}
+
+func (c *Config) marshalCommit() {
+	s := c.Raw.Section(commitSection)
+	if c.Commit.GpgSign.IsSet() {
+		s.SetOption(gpgSignKey, c.Commit.GpgSign.FormatBool())
 	}
 }
 
@@ -424,6 +855,10 @@ func (c *Config) marshalUser() {
 
 	if c.User.Email != "" {
 		s.SetOption(emailKey, c.User.Email)
+	}
+
+	if c.User.SigningKey != "" {
+		s.SetOption(signingKey, c.User.SigningKey)
 	}
 
 	s = c.Raw.Section(authorSection)
@@ -445,10 +880,29 @@ func (c *Config) marshalUser() {
 	}
 }
 
+func (c *Config) marshalGPG() {
+	s := c.Raw.Section(gpgSection)
+	if c.GPG.Format != "" {
+		s.SetOption(formatKey, c.GPG.Format)
+	}
+
+	// SSH subsection
+	if c.GPG.SSH.AllowedSignersFile != "" {
+		sub := s.Subsection("ssh")
+		sub.SetOption(allowedSignersFileKey, c.GPG.SSH.AllowedSignersFile)
+	}
+}
+
 func (c *Config) marshalPack() {
 	s := c.Raw.Section(packSection)
 	if c.Pack.Window != DefaultPackWindow {
 		s.SetOption(windowKey, fmt.Sprintf("%d", c.Pack.Window))
+	}
+	if !c.Pack.ReadReverseIndex {
+		s.SetOption(readReverseIndexKey, "false")
+	}
+	if !c.Pack.WriteReverseIndex {
+		s.SetOption(writeReverseIndexKey, "false")
 	}
 }
 
@@ -535,10 +989,32 @@ func (c *Config) marshalURLs() {
 	}
 }
 
+func (c *Config) marshalProtocol() {
+	// Only marshal protocol section if a version was set.
+	if c.Protocol.Version != DefaultProtocolVersion {
+		s := c.Raw.Section(protocolSection)
+		s.SetOption(versionKey, c.Protocol.Version.String())
+	}
+}
+
+func (c *Config) marshalIndex() {
+	if c.Index.SkipHash.IsSet() {
+		s := c.Raw.Section(indexSection)
+		s.SetOption(skipHashKey, c.Index.SkipHash.FormatBool())
+	}
+}
+
 func (c *Config) marshalInit() {
 	s := c.Raw.Section(initSection)
 	if c.Init.DefaultBranch != "" {
 		s.SetOption(defaultBranchKey, c.Init.DefaultBranch)
+	}
+}
+
+func (c *Config) marshalUploadArchive() {
+	if c.UploadArchive.AllowUnreachable.IsSet() {
+		s := c.Raw.Section(uploadArchiveSection)
+		s.SetOption(allowUnreachableKey, c.UploadArchive.AllowUnreachable.FormatBool())
 	}
 }
 
@@ -549,6 +1025,8 @@ type RemoteConfig struct {
 	// URLs the URLs of a remote repository. It must be non-empty. Fetch will
 	// always use the first URL, while push will use all of them.
 	URLs []string
+	// Mirror indicates that the repository is a mirror of remote.
+	Mirror bool
 
 	// insteadOfRulesApplied have urls been modified
 	insteadOfRulesApplied bool
@@ -583,7 +1061,7 @@ func (c *RemoteConfig) Validate() error {
 		c.Fetch = []RefSpec{RefSpec(fmt.Sprintf(DefaultFetchRefSpec, c.Name))}
 	}
 
-	return nil
+	return plumbing.NewRemoteHEADReferenceName(c.Name).Validate()
 }
 
 func (c *RemoteConfig) unmarshal(s *format.Subsection) error {
@@ -601,7 +1079,9 @@ func (c *RemoteConfig) unmarshal(s *format.Subsection) error {
 
 	c.Name = c.raw.Name
 	c.URLs = append([]string(nil), c.raw.Options.GetAll(urlKey)...)
+	c.URLs = append(c.URLs, c.raw.Options.GetAll(pushurlKey)...)
 	c.Fetch = fetch
+	c.Mirror = c.raw.Options.Get(mirrorKey) == "true"
 
 	return nil
 }
@@ -626,7 +1106,7 @@ func (c *RemoteConfig) marshal() *format.Subsection {
 	if len(c.Fetch) == 0 {
 		c.raw.RemoveOption(fetchKey)
 	} else {
-		var values []string
+		values := make([]string, 0, len(c.Fetch))
 		for _, rs := range c.Fetch {
 			values = append(values, rs.String())
 		}
@@ -634,9 +1114,14 @@ func (c *RemoteConfig) marshal() *format.Subsection {
 		c.raw.SetOption(fetchKey, values...)
 	}
 
+	if c.Mirror {
+		c.raw.SetOption(mirrorKey, strconv.FormatBool(c.Mirror))
+	}
+
 	return c.raw
 }
 
+// IsFirstURLLocal returns true if the first URL is a local path.
 func (c *RemoteConfig) IsFirstURLLocal() bool {
 	return url.IsLocalEndpoint(c.URLs[0])
 }

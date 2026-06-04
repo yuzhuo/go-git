@@ -5,42 +5,65 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	stdioutil "io/ioutil"
+	"io/fs"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/filemode"
-	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
-	"github.com/go-git/go-git/v5/plumbing/format/index"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/storer"
-	"github.com/go-git/go-git/v5/utils/ioutil"
-	"github.com/go-git/go-git/v5/utils/merkletrie"
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/util"
 
-	"github.com/go-git/go-billy/v5"
-	"github.com/go-git/go-billy/v5/util"
+	"github.com/go-git/go-git/v6/config"
+	giturl "github.com/go-git/go-git/v6/internal/url"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/format/gitignore"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/utils/convert"
+	"github.com/go-git/go-git/v6/utils/ioutil"
+	"github.com/go-git/go-git/v6/utils/merkletrie"
+	"github.com/go-git/go-git/v6/utils/sync"
+	"github.com/go-git/go-git/v6/utils/trace"
 )
 
+// Worktree errors.
 var (
-	ErrWorktreeNotClean     = errors.New("worktree is not clean")
-	ErrSubmoduleNotFound    = errors.New("submodule not found")
-	ErrUnstagedChanges      = errors.New("worktree contains unstaged changes")
-	ErrGitModulesSymlink    = errors.New(gitmodulesFile + " is a symlink")
+	// ErrWorktreeNotClean is returned when the worktree is not clean.
+	ErrWorktreeNotClean = errors.New("worktree is not clean")
+	// ErrSubmoduleNotFound is returned when the submodule is not found.
+	ErrSubmoduleNotFound = errors.New("submodule not found")
+	// ErrUnstagedChanges is returned when the worktree has unstaged changes.
+	ErrUnstagedChanges = errors.New("worktree contains unstaged changes")
+	// ErrLocalChanges is returned when a KeepReset is attempted but a file
+	// that would be changed by the reset has local modifications.
+	ErrLocalChanges = errors.New("worktree contains local changes that would be overwritten by reset")
+	// ErrGitModulesSymlink is returned when .gitmodules is a symlink.
+	ErrGitModulesSymlink = errors.New(gitmodulesFile + " is a symlink")
+	// ErrNonFastForwardUpdate is returned when a non-fast-forward update is attempted.
 	ErrNonFastForwardUpdate = errors.New("non-fast-forward update")
+	// ErrRestoreWorktreeOnlyNotSupported is returned when worktree only restore is not supported.
+	ErrRestoreWorktreeOnlyNotSupported = errors.New("worktree only is not supported")
+	// ErrSparseResetDirectoryNotFound is returned when a sparse-reset directory is not found.
+	ErrSparseResetDirectoryNotFound = errors.New("sparse-reset directory not found on commit")
 )
 
 // Worktree represents a git worktree.
 type Worktree struct {
-	// Filesystem underlying filesystem.
-	Filesystem billy.Filesystem
 	// External excludes not found in the repository .gitignore
 	Excludes []gitignore.Pattern
 
-	r *Repository
+	r          *Repository
+	filesystem *worktreeFilesystem
+}
+
+// Filesystem returns the underlying filesystem for the worktree.
+func (w *Worktree) Filesystem() billy.Filesystem {
+	return w.filesystem.Filesystem
 }
 
 // Pull incorporates changes from a remote repository into the current branch.
@@ -62,6 +85,13 @@ func (w *Worktree) Pull(o *PullOptions) error {
 // operation is complete, an error is returned. The context only affects the
 // transport operations.
 func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
+	if trace.Performance.Enabled() {
+		start := time.Now()
+		defer func() {
+			trace.Performance.Printf("performance: %.9f s: git command: git pull", time.Since(start).Seconds())
+		}()
+	}
+
 	if err := o.Validate(); err != nil {
 		return err
 	}
@@ -72,17 +102,16 @@ func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
 	}
 
 	fetchHead, err := remote.fetch(ctx, &FetchOptions{
-		RemoteName:      o.RemoteName,
-		Depth:           o.Depth,
-		Auth:            o.Auth,
-		Progress:        o.Progress,
-		Force:           o.Force,
-		InsecureSkipTLS: o.InsecureSkipTLS,
-		CABundle:        o.CABundle,
+		RemoteName:    o.RemoteName,
+		RemoteURL:     o.RemoteURL,
+		Depth:         o.Depth,
+		ClientOptions: o.ClientOptions,
+		Progress:      o.Progress,
+		Force:         o.Force,
 	})
 
 	updated := true
-	if err == NoErrAlreadyUpToDate {
+	if errors.Is(err, NoErrAlreadyUpToDate) {
 		updated = false
 	} else if err != nil {
 		return err
@@ -95,7 +124,10 @@ func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
 
 	head, err := w.r.Head()
 	if err == nil {
-		headAheadOfRef, err := isFastForward(w.r.Storer, ref.Hash(), head.Hash())
+		// if we don't have a shallows list, just ignore it
+		shallowList, _ := w.r.Storer.Shallow()
+
+		headAheadOfRef, err := isFastForward(w.r.Storer, ref.Hash(), head.Hash(), shallowList)
 		if err != nil {
 			return err
 		}
@@ -104,7 +136,7 @@ func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
 			return NoErrAlreadyUpToDate
 		}
 
-		ff, err := isFastForward(w.r.Storer, head.Hash(), ref.Hash())
+		ff, err := isFastForward(w.r.Storer, head.Hash(), ref.Hash(), shallowList)
 		if err != nil {
 			return err
 		}
@@ -114,7 +146,7 @@ func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
 		}
 	}
 
-	if err != nil && err != plumbing.ErrReferenceNotFound {
+	if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
 		return err
 	}
 
@@ -130,26 +162,33 @@ func (w *Worktree) PullContext(ctx context.Context, o *PullOptions) error {
 	}
 
 	if o.RecurseSubmodules != NoRecurseSubmodules {
-		return w.updateSubmodules(&SubmoduleUpdateOptions{
+		return w.updateSubmodules(ctx, &SubmoduleUpdateOptions{
 			RecurseSubmodules: o.RecurseSubmodules,
-			Auth:              o.Auth,
+			ClientOptions:     o.ClientOptions,
 		})
 	}
 
 	return nil
 }
 
-func (w *Worktree) updateSubmodules(o *SubmoduleUpdateOptions) error {
+func (w *Worktree) updateSubmodules(ctx context.Context, o *SubmoduleUpdateOptions) error {
 	s, err := w.Submodules()
 	if err != nil {
 		return err
 	}
 	o.Init = true
-	return s.Update(o)
+	return s.UpdateContext(ctx, o)
 }
 
 // Checkout switch branches or restore working tree files.
 func (w *Worktree) Checkout(opts *CheckoutOptions) error {
+	if trace.Performance.Enabled() {
+		start := time.Now()
+		defer func() {
+			trace.Performance.Printf("performance: %.9f s: git command: git checkout", time.Since(start).Seconds())
+		}()
+	}
+
 	if err := opts.Validate(); err != nil {
 		return err
 	}
@@ -165,7 +204,11 @@ func (w *Worktree) Checkout(opts *CheckoutOptions) error {
 		return err
 	}
 
-	ro := &ResetOptions{Commit: c, Mode: MergeReset}
+	ro := &ResetOptions{
+		Commit:     c,
+		Mode:       MergeReset,
+		SparseDirs: opts.SparseCheckoutDirectories,
+	}
 	if opts.Force {
 		ro.Mode = HardReset
 	} else if opts.Keep {
@@ -184,13 +227,18 @@ func (w *Worktree) Checkout(opts *CheckoutOptions) error {
 
 	return w.Reset(ro)
 }
+
 func (w *Worktree) createBranch(opts *CheckoutOptions) error {
+	if err := opts.Branch.Validate(); err != nil {
+		return err
+	}
+
 	_, err := w.r.Storer.Reference(opts.Branch)
 	if err == nil {
 		return fmt.Errorf("a branch named %q already exists", opts.Branch)
 	}
 
-	if err != plumbing.ErrReferenceNotFound {
+	if !errors.Is(err, plumbing.ErrReferenceNotFound) {
 		return err
 	}
 
@@ -209,20 +257,17 @@ func (w *Worktree) createBranch(opts *CheckoutOptions) error {
 }
 
 func (w *Worktree) getCommitFromCheckoutOptions(opts *CheckoutOptions) (plumbing.Hash, error) {
-	if !opts.Hash.IsZero() {
-		return opts.Hash, nil
+	hash := opts.Hash
+	if hash.IsZero() {
+		b, err := w.r.Reference(opts.Branch, true)
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+
+		hash = b.Hash()
 	}
 
-	b, err := w.r.Reference(opts.Branch, true)
-	if err != nil {
-		return plumbing.ZeroHash, err
-	}
-
-	if !b.Name().IsTag() {
-		return b.Hash(), nil
-	}
-
-	o, err := w.r.Object(plumbing.AnyObject, b.Hash())
+	o, err := w.r.Object(plumbing.AnyObject, hash)
 	if err != nil {
 		return plumbing.ZeroHash, err
 	}
@@ -230,7 +275,7 @@ func (w *Worktree) getCommitFromCheckoutOptions(opts *CheckoutOptions) (plumbing
 	switch o := o.(type) {
 	case *object.Tag:
 		if o.TargetType != plumbing.CommitObject {
-			return plumbing.ZeroHash, fmt.Errorf("unsupported tag object target %q", o.TargetType)
+			return plumbing.ZeroHash, fmt.Errorf("%w: tag target %q", object.ErrUnsupportedObject, o.TargetType)
 		}
 
 		return o.Target, nil
@@ -238,7 +283,7 @@ func (w *Worktree) getCommitFromCheckoutOptions(opts *CheckoutOptions) (plumbing
 		return o.Hash, nil
 	}
 
-	return plumbing.ZeroHash, fmt.Errorf("unsupported tag target %q", o.Type())
+	return plumbing.ZeroHash, fmt.Errorf("%w: %q", object.ErrUnsupportedObject, o.Type())
 }
 
 func (w *Worktree) setHEADToCommit(commit plumbing.Hash) error {
@@ -264,12 +309,24 @@ func (w *Worktree) setHEADToBranch(branch plumbing.ReferenceName, commit plumbin
 
 // Reset the worktree to a specified state.
 func (w *Worktree) Reset(opts *ResetOptions) error {
+	if trace.Performance.Enabled() {
+		start := time.Now()
+		defer func() {
+			trace.Performance.Printf("performance: %.9f s: reset_worktree", time.Since(start).Seconds())
+		}()
+	}
+
 	if err := opts.Validate(w.r); err != nil {
 		return err
 	}
 
+	cfg, err := w.r.Config()
+	if err != nil {
+		return err
+	}
+
 	if opts.Mode == MergeReset {
-		unstaged, err := w.containsUnstagedChanges()
+		unstaged, err := w.containsUnstagedChanges(cfg)
 		if err != nil {
 			return err
 		}
@@ -279,27 +336,58 @@ func (w *Worktree) Reset(opts *ResetOptions) error {
 		}
 	}
 
-	if err := w.setHEADCommit(opts.Commit); err != nil {
-		return err
-	}
-
 	if opts.Mode == SoftReset {
-		return nil
+		return w.setHEADCommit(opts.Commit)
 	}
 
-	t, err := w.getTreeFromCommitHash(opts.Commit)
+	t, err := w.r.getTreeFromCommitHash(opts.Commit)
 	if err != nil {
 		return err
 	}
 
-	if opts.Mode == MixedReset || opts.Mode == MergeReset || opts.Mode == HardReset {
-		if err := w.resetIndex(t); err != nil {
+	if len(opts.SparseDirs) > 0 && !opts.SkipSparseDirValidation {
+		if !treeContainsDirs(t, opts.SparseDirs) {
+			return ErrSparseResetDirectoryNotFound
+		}
+	}
+
+	// For HardReset and KeepReset, capture the current HEAD tree before
+	// resetting HEAD. resetWorktreeToTree will diff prevTree→t and apply only
+	// those changes to the worktree. Since the diff is tree-to-tree, untracked
+	// files are invisible and are never deleted — matching real git reset --hard.
+	var prevTree *object.Tree
+	if opts.Mode == HardReset || opts.Mode == KeepReset {
+		prevTree, err = w.headTree()
+		if err != nil {
 			return err
 		}
 	}
 
-	if opts.Mode == MergeReset || opts.Mode == HardReset {
-		if err := w.resetWorktree(t); err != nil {
+	if opts.Mode == KeepReset {
+		if err := w.checkKeepResetConflicts(prevTree, t, opts.SparseDirs, opts.Files); err != nil {
+			return err
+		}
+	}
+
+	if err := w.setHEADCommit(opts.Commit); err != nil {
+		return err
+	}
+
+	var removedFiles []string
+	if opts.Mode == MixedReset || opts.Mode == MergeReset || opts.Mode == HardReset || opts.Mode == KeepReset {
+		if removedFiles, err = w.resetIndex(t, opts.SparseDirs, opts.Files); err != nil {
+			return err
+		}
+	}
+
+	if opts.Mode == MergeReset && len(removedFiles) > 0 {
+		if err := w.resetWorktree(cfg, t, removedFiles); err != nil {
+			return err
+		}
+	}
+
+	if opts.Mode == HardReset || opts.Mode == KeepReset {
+		if err := w.resetWorktreeToTree(cfg, prevTree, t, opts.Files); err != nil {
 			return err
 		}
 	}
@@ -307,22 +395,80 @@ func (w *Worktree) Reset(opts *ResetOptions) error {
 	return nil
 }
 
-func (w *Worktree) resetIndex(t *object.Tree) error {
-	idx, err := w.r.Storer.Index()
-	if err != nil {
+// treeContainsDirs checks if the given tree contains all the directories.
+// if dirs is empty, it returns false.
+func treeContainsDirs(tree *object.Tree, dirs []string) bool {
+	if len(dirs) == 0 {
+		return false
+	}
+
+	for _, dir := range dirs {
+		entry, err := tree.FindEntry(dir)
+		if err != nil {
+			return false
+		}
+		if entry.Mode != filemode.Dir {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Restore restores specified files in the working tree or stage with contents from
+// a restore source. If a path is tracked but does not exist in the restore
+// source, it will be removed to match the source.
+//
+// If Staged and Worktree are true, then the restore source will be the index.
+// If only Staged is true, then the restore source will be HEAD.
+// If only Worktree is true or neither Staged nor Worktree are true, will
+// result in ErrRestoreWorktreeOnlyNotSupported because restoring the working
+// tree while leaving the stage untouched is not currently supported.
+//
+// Restore with no files specified will return ErrNoRestorePaths.
+func (w *Worktree) Restore(o *RestoreOptions) error {
+	if err := o.Validate(); err != nil {
 		return err
 	}
+
+	if o.Staged {
+		opts := &ResetOptions{
+			Files: o.Files,
+		}
+
+		if o.Worktree {
+			// If we are doing both Worktree and Staging then it is a hard reset
+			opts.Mode = HardReset
+		} else {
+			// If we are doing just staging then it is a mixed reset
+			opts.Mode = MixedReset
+		}
+
+		return w.Reset(opts)
+	}
+
+	return ErrRestoreWorktreeOnlyNotSupported
+}
+
+func (w *Worktree) resetIndex(t *object.Tree, dirs, files []string) ([]string, error) {
+	idx, err := w.r.Storer.Index()
+	if err != nil {
+		return nil, err
+	}
+
 	b := newIndexBuilder(idx)
 
 	changes, err := w.diffTreeWithStaging(t, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	removedFiles := make([]string, 0, len(changes))
+	filesMap := buildFilePathMap(files)
 	for _, ch := range changes {
 		a, err := ch.Action()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		var name string
@@ -333,13 +479,21 @@ func (w *Worktree) resetIndex(t *object.Tree) error {
 			name = ch.To.String()
 			e, err = t.FindEntry(name)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		case merkletrie.Delete:
 			name = ch.From.String()
 		}
 
+		if len(files) > 0 {
+			contains := inFiles(filesMap, name)
+			if !contains {
+				continue
+			}
+		}
+
 		b.Remove(name)
+		removedFiles = append(removedFiles, name)
 		if e == nil {
 			continue
 		}
@@ -349,15 +503,206 @@ func (w *Worktree) resetIndex(t *object.Tree) error {
 			Hash: e.Hash,
 			Mode: e.Mode,
 		})
-
 	}
 
 	b.Write(idx)
-	return w.r.Storer.SetIndex(idx)
+
+	if len(dirs) > 0 {
+		idx.SkipUnless(dirs)
+	}
+
+	return removedFiles, w.r.Storer.SetIndex(idx)
 }
 
-func (w *Worktree) resetWorktree(t *object.Tree) error {
-	changes, err := w.diffStagingWithWorktree(true)
+// inFiles checks if the given file is in the list of files. The incoming filepaths in files should be cleaned before calling this function.
+func inFiles(files map[string]struct{}, v string) bool {
+	v = filepath.Clean(v)
+	_, exists := files[v]
+	return exists
+}
+
+// headTree returns the tree for the current HEAD commit.
+// Returns nil, nil if there is no HEAD yet (e.g. an unborn branch).
+func (w *Worktree) headTree() (*object.Tree, error) {
+	head, err := w.r.Head()
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	c, err := w.r.CommitObject(head.Hash())
+	if err != nil {
+		return nil, err
+	}
+	return c.Tree()
+}
+
+// checkKeepResetConflicts implements the safety check for KeepReset
+// (git reset --keep): it aborts if any file that would be modified by the
+// reset has local staged or unstaged modifications in the worktree.
+//
+// Two categories of "touched" paths are checked:
+//
+//  1. Files that differ between fromTree and toTree (filtered by files when
+//     non-empty). Among these, paths that will be *written* to disk (Insert or
+//     Modify) are additionally checked for untracked-overwrite collisions.
+//
+//  2. When sparseDirs is non-empty: currently-on-disk tracked files that will
+//     become SkipWorktree because their path is no longer under any of the new
+//     sparse directories. Step 3 of resetWorktreeToTree removes them from disk,
+//     so KeepReset must refuse if they carry local modifications.
+func (w *Worktree) checkKeepResetConflicts(fromTree, toTree *object.Tree, sparseDirs, files []string) error {
+	changes, err := diffTrees(fromTree, toTree)
+	if err != nil {
+		return err
+	}
+
+	filesMap := buildFilePathMap(files)
+
+	// touched: all paths that the reset will affect (checked for local mods).
+	// writtenPaths: subset of touched that will be written to disk (Insert /
+	// Modify). An untracked file at such a path would be silently overwritten,
+	// which KeepReset must refuse — matching git reset --keep behaviour.
+	touched := make(map[string]struct{})
+	writtenPaths := make(map[string]struct{})
+
+	for _, ch := range changes {
+		// Canonical path for the files-filter: prefer To (Insert/Modify),
+		// fall back to From (Delete).
+		var name string
+		if ch.To != nil {
+			name = ch.To.String()
+		} else {
+			name = ch.From.String()
+		}
+		if len(files) > 0 && !inFiles(filesMap, name) {
+			continue
+		}
+		if ch.From != nil {
+			touched[ch.From.String()] = struct{}{}
+		}
+		if ch.To != nil {
+			touched[ch.To.String()] = struct{}{}
+			writtenPaths[ch.To.String()] = struct{}{}
+		}
+	}
+
+	// When SparseDirs is changing, any currently-on-disk tracked file that
+	// falls outside the new sparse set will be removed from disk by step 3 of
+	// resetWorktreeToTree. KeepReset must refuse if such a file has local mods.
+	if len(sparseDirs) > 0 {
+		idx, err := w.r.Storer.Index()
+		if err != nil {
+			return err
+		}
+		for _, e := range idx.Entries {
+			if e.SkipWorktree {
+				continue // already excluded from the worktree
+			}
+			if len(files) > 0 && !inFiles(filesMap, e.Name) {
+				continue
+			}
+			included := false
+			for _, dir := range sparseDirs {
+				if strings.HasPrefix(e.Name, dir+"/") || e.Name == dir {
+					included = true
+					break
+				}
+			}
+			if !included {
+				touched[e.Name] = struct{}{}
+			}
+		}
+	}
+
+	if len(touched) == 0 {
+		return nil
+	}
+
+	// Check worktree status for local modifications on touched paths.
+	status, err := w.Status()
+	if err != nil {
+		return err
+	}
+	for path, st := range status {
+		if _, willChange := touched[path]; !willChange {
+			continue
+		}
+		// Tracked file with staged or unstaged local changes → conflict.
+		if (st.Staging != Unmodified && st.Staging != Untracked) ||
+			(st.Worktree != Unmodified && st.Worktree != Untracked) {
+			return fmt.Errorf("%w: %s", ErrLocalChanges, path)
+		}
+		// Untracked file at a path that will be written to disk → the reset
+		// would silently overwrite it, which KeepReset must refuse.
+		if st.Staging == Untracked && st.Worktree == Untracked {
+			if _, willWrite := writtenPaths[path]; willWrite {
+				return fmt.Errorf("%w: %s", ErrLocalChanges, path)
+			}
+		}
+	}
+	return nil
+}
+
+// resetWorktreeToTree updates the worktree to match toTree, mirroring
+// real git reset --hard / checkout -f:
+//
+//  1. Tree-to-tree diff (fromTree→toTree): remove files that were tracked in
+//     fromTree but deleted in toTree. Because the diff is purely object-graph,
+//     untracked files never appear and are never deleted.
+//
+//  2. New-index-to-worktree diff: write files that are in the new index but
+//     absent or different on disk. For Delete actions (file on disk, but absent
+//     from the index): the file is truly untracked and is preserved.
+//     (SkipWorktree entries are invisible to the merkletrie diff; they are
+//     handled in step 3.)
+//
+//  3. Remove SkipWorktree files from disk: diffStagingWithWorktree never
+//     surfaces SkipWorktree-flagged entries as Delete actions because the
+//     merkletrie marks them skip=true. Mirror git's behaviour: any tracked
+//     file with SkipWorktree=true must not exist in the worktree.
+//
+// files optionally restricts the operation to a specific subset of paths.
+func (w *Worktree) resetWorktreeToTree(cfg *config.Config, fromTree, toTree *object.Tree, files []string) error {
+	filesMap := buildFilePathMap(files)
+
+	// Step 1: delete files removed from the tracked tree.
+	treeChanges, err := diffTrees(fromTree, toTree)
+	if err != nil {
+		return err
+	}
+	for _, ch := range treeChanges {
+		a, err := ch.Action()
+		if err != nil {
+			return err
+		}
+		if a != merkletrie.Delete {
+			continue
+		}
+		name := ch.From.String()
+		if len(files) > 0 && !inFiles(filesMap, name) {
+			continue
+		}
+		if err := rmFileAndDirsIfEmpty(w.filesystem, name); err != nil {
+			return err
+		}
+	}
+
+	// Step 2: write files that are in the new index but missing or stale
+	// in the worktree. We use diffStagingWithWorktree(reverse=true) which
+	// gives Insert for "in index, not on disk" and Modify for "differs".
+	// Delete means "on disk, not in index" = untracked → always skip.
+	// Note: SkipWorktree entries are invisible to the merkletrie diff;
+	// they are cleaned up in step 3 below.
+	//
+	// excludeIgnoredChanges=true engages the filesystem walker's
+	// IgnoreMatcher so untracked entries inside gitignored directories are
+	// pruned at enumeration time rather than walked and then dropped as
+	// Delete actions. The observable result is unchanged because Delete
+	// actions are skipped by the loop below; the matcher only avoids the
+	// pointless lstat of every file under directories like node_modules.
+	worktreeChanges, err := w.diffStagingWithWorktree(cfg, true, true)
 	if err != nil {
 		return err
 	}
@@ -368,8 +713,47 @@ func (w *Worktree) resetWorktree(t *object.Tree) error {
 	}
 	b := newIndexBuilder(idx)
 
-	for _, ch := range changes {
-		if err := w.checkoutChange(ch, t, b); err != nil {
+	for _, ch := range worktreeChanges {
+		a, err := ch.Action()
+		if err != nil {
+			return err
+		}
+		if a == merkletrie.Delete {
+			// In the reverse diff, Delete means the file exists on disk but is
+			// absent from the index node tree. SkipWorktree entries are marked
+			// skip=true in the merkletrie and never appear here; they are removed
+			// in step 3 below. A Delete action here therefore always means the
+			// file is truly untracked — preserve it.
+			continue
+		}
+
+		if len(files) > 0 {
+			file := ch.To.String()
+			if !inFiles(filesMap, file) {
+				continue
+			}
+		}
+
+		if err := w.checkoutChange(cfg, ch, toTree, b); err != nil {
+			return err
+		}
+	}
+
+	// Step 3: remove tracked files that are SkipWorktree=true from disk.
+	// diffStagingWithWorktree builds the index node tree with skip=true for
+	// SkipWorktree entries, so they never appear as Delete actions in step 2.
+	// git removes these files when the sparse-checkout contract excludes them.
+	for _, e := range idx.Entries {
+		if !e.SkipWorktree {
+			continue
+		}
+		if len(files) > 0 && !inFiles(filesMap, e.Name) {
+			continue
+		}
+		if _, statErr := w.filesystem.Lstat(e.Name); os.IsNotExist(statErr) {
+			continue
+		}
+		if err := rmFileAndDirsIfEmpty(w.filesystem, e.Name); err != nil {
 			return err
 		}
 	}
@@ -378,7 +762,57 @@ func (w *Worktree) resetWorktree(t *object.Tree) error {
 	return w.r.Storer.SetIndex(idx)
 }
 
-func (w *Worktree) checkoutChange(ch merkletrie.Change, t *object.Tree, idx *indexBuilder) error {
+// resetWorktree updates the worktree to match the staging area.
+// files restricts the operation to the named paths; nil means all files.
+//
+// excludeIgnoredChanges is intentionally false here. The caller is
+// MergeReset, and files contains paths that were just removed from the
+// index by resetIndex. A tracked-but-gitignored path that was removed
+// from the index in this same Reset is no longer in idxMap, so the
+// noder's IgnoreMatcher would prune it from the walk and the Delete
+// action needed to remove it from disk would never be emitted.
+func (w *Worktree) resetWorktree(cfg *config.Config, t *object.Tree, files []string) error {
+	changes, err := w.diffStagingWithWorktree(cfg, true, false)
+	if err != nil {
+		return err
+	}
+
+	idx, err := w.r.Storer.Index()
+	if err != nil {
+		return err
+	}
+	b := newIndexBuilder(idx)
+
+	filesMap := buildFilePathMap(files)
+	for _, ch := range changes {
+		if len(files) > 0 {
+			file := ""
+			if ch.From != nil {
+				file = ch.From.String()
+			} else if ch.To != nil {
+				file = ch.To.String()
+			}
+
+			if file == "" {
+				continue
+			}
+
+			contains := inFiles(filesMap, file)
+			if !contains {
+				continue
+			}
+		}
+
+		if err := w.checkoutChange(cfg, ch, t, b); err != nil {
+			return err
+		}
+	}
+
+	b.Write(idx)
+	return w.r.Storer.SetIndex(idx)
+}
+
+func (w *Worktree) checkoutChange(cfg *config.Config, ch merkletrie.Change, t *object.Tree, idx *indexBuilder) error {
 	a, err := ch.Action()
 	if err != nil {
 		return err
@@ -391,6 +825,9 @@ func (w *Worktree) checkoutChange(ch merkletrie.Change, t *object.Tree, idx *ind
 	switch a {
 	case merkletrie.Modify, merkletrie.Insert:
 		name = ch.To.String()
+		// FindEntry validates name via pathutil.ValidTreePath, so a
+		// dangerous tree-derived path is refused at the lookup
+		// boundary before we materialise anything.
 		e, err = t.FindEntry(name)
 		if err != nil {
 			return err
@@ -398,18 +835,26 @@ func (w *Worktree) checkoutChange(ch merkletrie.Change, t *object.Tree, idx *ind
 
 		isSubmodule = e.Mode == filemode.Submodule
 	case merkletrie.Delete:
-		return rmFileAndDirIfEmpty(w.Filesystem, ch.From.String())
+		// checkoutChange.Delete is only reached from resetWorktree's
+		// filesystem-vs-index merkletrie diff (resetWorktreeToTree's
+		// tree-derived deletes call rmFileAndDirsIfEmpty directly).
+		// The path source is therefore the local worktree filesystem,
+		// where the tolerant worktreeFilesystem wrapper is the right
+		// fit: we want to be able to clean up legitimately-tracked
+		// shapes like "submodule/.git" rather than abort the whole
+		// reset on a single weird untracked file.
+		return rmFileAndDirsIfEmpty(w.filesystem, ch.From.String())
 	}
 
 	if isSubmodule {
 		return w.checkoutChangeSubmodule(name, a, e, idx)
 	}
 
-	return w.checkoutChangeRegularFile(name, a, t, e, idx)
+	return w.checkoutChangeRegularFile(cfg, name, a, t, e, idx)
 }
 
-func (w *Worktree) containsUnstagedChanges() (bool, error) {
-	ch, err := w.diffStagingWithWorktree(false)
+func (w *Worktree) containsUnstagedChanges(cfg *config.Config) (bool, error) {
+	ch, err := w.diffStagingWithWorktree(cfg, false, true)
 	if err != nil {
 		return false, err
 	}
@@ -477,7 +922,7 @@ func (w *Worktree) checkoutChangeSubmodule(name string,
 			return err
 		}
 
-		if err := w.Filesystem.MkdirAll(name, mode); err != nil {
+		if err := w.filesystem.MkdirAll(name, mode); err != nil {
 			return err
 		}
 
@@ -487,7 +932,8 @@ func (w *Worktree) checkoutChangeSubmodule(name string,
 	return nil
 }
 
-func (w *Worktree) checkoutChangeRegularFile(name string,
+func (w *Worktree) checkoutChangeRegularFile(cfg *config.Config,
+	name string,
 	a merkletrie.Action,
 	t *object.Tree,
 	e *object.TreeEntry,
@@ -499,7 +945,7 @@ func (w *Worktree) checkoutChangeRegularFile(name string,
 
 		// to apply perm changes the file is deleted, billy doesn't implement
 		// chmod
-		if err := w.Filesystem.Remove(name); err != nil {
+		if err := w.filesystem.Remove(name); err != nil {
 			return err
 		}
 
@@ -510,7 +956,7 @@ func (w *Worktree) checkoutChangeRegularFile(name string,
 			return err
 		}
 
-		if err := w.checkoutFile(f); err != nil {
+		if err := w.checkoutFile(cfg, f); err != nil {
 			return err
 		}
 
@@ -520,62 +966,85 @@ func (w *Worktree) checkoutChangeRegularFile(name string,
 	return nil
 }
 
-var copyBufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 32*1024)
-	},
-}
-
-func (w *Worktree) checkoutFile(f *object.File) (err error) {
+func (w *Worktree) checkoutFile(cfg *config.Config, f *object.File) (err error) {
 	mode, err := f.Mode.ToOSFileMode()
 	if err != nil {
-		return
+		return err
 	}
 
 	if mode&os.ModeSymlink != 0 {
 		return w.checkoutFileSymlink(f)
 	}
 
-	from, err := f.Reader()
+	dstFile, err := w.filesystem.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
 	if err != nil {
-		return
+		return err
+	}
+	defer ioutil.CheckClose(dstFile, &err)
+
+	return w.copyObjectToWorktree(cfg, f, dstFile)
+}
+
+func (w *Worktree) copyObjectToWorktree(cfg *config.Config, object *object.File, file billy.File) (err error) {
+	var src io.ReadCloser
+	var dst io.Writer = file
+
+	src, err = object.Reader()
+	if err != nil {
+		return err
+	}
+	defer ioutil.CheckClose(src, &err)
+
+	if cfg.Core.AutoCRLF == "true" {
+		br := sync.GetBufioReader(src)
+		defer sync.PutBufioReader(br)
+
+		stat, err := convert.GetStat(br)
+		if err != nil {
+			return err
+		}
+
+		src, err = object.Reader()
+		if err != nil {
+			return err
+		}
+		defer ioutil.CheckClose(src, &err)
+
+		if !stat.IsBinary() {
+			dst = convert.NewCRLFWriter(dst)
+		}
 	}
 
-	defer ioutil.CheckClose(from, &err)
-
-	to, err := w.Filesystem.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
-	if err != nil {
-		return
-	}
-
-	defer ioutil.CheckClose(to, &err)
-	buf := copyBufferPool.Get().([]byte)
-	_, err = io.CopyBuffer(to, from, buf)
-	copyBufferPool.Put(buf)
-	return
+	_, err = ioutil.CopyBufferPool(dst, src)
+	return err
 }
 
 func (w *Worktree) checkoutFileSymlink(f *object.File) (err error) {
+	// .gitmodules symlink rejection (and its NTFS / HFS variants) is
+	// enforced by the worktreeFilesystem wrapper's Symlink method via
+	// validSymlinkName. See https://github.com/git/git/commit/10ecfa7
+	// for the upstream rationale.
+
 	from, err := f.Reader()
 	if err != nil {
-		return
+		return err
 	}
 
 	defer ioutil.CheckClose(from, &err)
 
-	bytes, err := stdioutil.ReadAll(from)
+	bytes, err := io.ReadAll(from)
 	if err != nil {
-		return
+		return err
 	}
 
-	err = w.Filesystem.Symlink(string(bytes), f.Name)
+	err = w.filesystem.Symlink(string(bytes), f.Name)
 
 	// On windows, this might fail.
 	// Follow Git on Windows behavior by writing the link as it is.
 	if err != nil && isSymlinkWindowsNonAdmin(err) {
 		mode, _ := f.Mode.ToOSFileMode()
 
-		to, err := w.Filesystem.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
+		to, err := w.filesystem.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
 		if err != nil {
 			return err
 		}
@@ -585,7 +1054,7 @@ func (w *Worktree) checkoutFileSymlink(f *object.File) (err error) {
 		_, err = to.Write(bytes)
 		return err
 	}
-	return
+	return err
 }
 
 func (w *Worktree) addIndexFromTreeEntry(name string, f *object.TreeEntry, idx *indexBuilder) error {
@@ -600,7 +1069,7 @@ func (w *Worktree) addIndexFromTreeEntry(name string, f *object.TreeEntry, idx *
 
 func (w *Worktree) addIndexFromFile(name string, h plumbing.Hash, idx *indexBuilder) error {
 	idx.Remove(name)
-	fi, err := w.Filesystem.Lstat(name)
+	fi, err := w.filesystem.Lstat(name)
 	if err != nil {
 		return err
 	}
@@ -627,8 +1096,8 @@ func (w *Worktree) addIndexFromFile(name string, h plumbing.Hash, idx *indexBuil
 	return nil
 }
 
-func (w *Worktree) getTreeFromCommitHash(commit plumbing.Hash) (*object.Tree, error) {
-	c, err := w.r.CommitObject(commit)
+func (r *Repository) getTreeFromCommitHash(commit plumbing.Hash) (*object.Tree, error) {
+	c, err := r.CommitObject(commit)
 	if err != nil {
 		return nil, err
 	}
@@ -636,7 +1105,7 @@ func (w *Worktree) getTreeFromCommitHash(commit plumbing.Hash) (*object.Tree, er
 	return c.Tree()
 }
 
-var fillSystemInfo func(e *index.Entry, sys interface{})
+var fillSystemInfo func(e *index.Entry, sys any)
 
 const gitmodulesFile = ".gitmodules"
 
@@ -656,21 +1125,65 @@ func (w *Worktree) Submodule(name string) (*Submodule, error) {
 	return nil, ErrSubmoduleNotFound
 }
 
+// resolveModuleURL resolves relative URLs based on the originURL.
+// The moduleURL is returned verbatim when originURL is empty or moduleURL is an absolute URL.
+func resolveModuleURL(originURL, moduleURL string) (string, error) {
+	if originURL == "" {
+		return moduleURL, nil
+	}
+	if !strings.HasPrefix(moduleURL, "../") && !strings.HasPrefix(moduleURL, "./") {
+		return moduleURL, nil
+	}
+	if !giturl.MatchesScheme(originURL) && giturl.MatchesScpLike(originURL) {
+		user, host, portStr, p := giturl.FindScpLikeComponents(originURL)
+		p = path.Join(p, moduleURL)
+		if portStr != "" {
+			portStr += ":"
+		}
+		return fmt.Sprintf("%s@%s:%s%s", user, host, portStr, p), nil
+	}
+	base, err := url.Parse(originURL)
+	if err != nil {
+		return "", err
+	}
+	base.Path = path.Join(base.Path, moduleURL)
+	return base.String(), nil
+}
+
 // Submodules returns all the available submodules
 func (w *Worktree) Submodules() (Submodules, error) {
+	cfg, err := w.r.Config()
+	if err != nil {
+		return nil, err
+	}
+
+	return w.submodulesWithConfig(cfg)
+}
+
+// submodulesWithConfig returns all the available submodules using an already-loaded config.
+func (w *Worktree) submodulesWithConfig(cfg *config.Config) (Submodules, error) {
 	l := make(Submodules, 0)
 	m, err := w.readGitmodulesFile()
 	if err != nil || m == nil {
 		return l, err
 	}
 
-	c, err := w.r.Config()
-	if err != nil {
-		return nil, err
+	var originURL string
+	if origin, err := w.r.Remote(DefaultRemoteName); err == nil {
+		if origin.c != nil && len(origin.c.URLs) > 0 {
+			originURL = origin.c.URLs[0]
+		}
 	}
 
 	for _, s := range m.Submodules {
-		l = append(l, w.newSubmodule(s, c.Submodules[s.Name]))
+		sub := w.newSubmodule(s, cfg.Submodules[s.Name])
+		subCfg := sub.Config()
+		resolvedURL, err := resolveModuleURL(originURL, subCfg.URL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve submodule URL %q: %w", s.URL, err)
+		}
+		subCfg.URL = resolvedURL
+		l = append(l, sub)
 	}
 
 	return l, nil
@@ -691,7 +1204,7 @@ func (w *Worktree) newSubmodule(fromModules, fromConfig *config.Submodule) *Subm
 }
 
 func (w *Worktree) isSymlink(path string) bool {
-	if s, err := w.Filesystem.Lstat(path); err == nil {
+	if s, err := w.filesystem.Lstat(path); err == nil {
 		return s.Mode()&os.ModeSymlink != 0
 	}
 	return false
@@ -702,7 +1215,7 @@ func (w *Worktree) readGitmodulesFile() (*config.Modules, error) {
 		return nil, ErrGitModulesSymlink
 	}
 
-	f, err := w.Filesystem.Open(gitmodulesFile)
+	f, err := w.filesystem.Open(gitmodulesFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -711,15 +1224,15 @@ func (w *Worktree) readGitmodulesFile() (*config.Modules, error) {
 		return nil, err
 	}
 
-	defer f.Close()
-	input, err := stdioutil.ReadAll(f)
+	defer func() { _ = f.Close() }()
+	input, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
 
 	m := config.NewModules()
 	if err := m.Unmarshal(input); err != nil {
-		return m, err
+		return nil, err
 	}
 
 	return m, nil
@@ -734,14 +1247,14 @@ func (w *Worktree) Clean(opts *CleanOptions) error {
 	}
 
 	root := ""
-	files, err := w.Filesystem.ReadDir(root)
+	files, err := w.filesystem.ReadDir(root)
 	if err != nil {
 		return err
 	}
 	return w.doClean(s, opts, root, files)
 }
 
-func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files []os.FileInfo) error {
+func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files []fs.DirEntry) error {
 	for _, fi := range files {
 		if fi.Name() == GitDirName {
 			continue
@@ -754,7 +1267,7 @@ func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files 
 				continue
 			}
 
-			subfiles, err := w.Filesystem.ReadDir(path)
+			subfiles, err := w.filesystem.ReadDir(path)
 			if err != nil {
 				return err
 			}
@@ -762,18 +1275,18 @@ func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files 
 			if err != nil {
 				return err
 			}
-		} else {
-			if status.IsUntracked(path) {
-				if err := w.Filesystem.Remove(path); err != nil {
-					return err
-				}
+		} else if status.IsUntracked(path) {
+			if err := w.filesystem.Remove(path); err != nil {
+				return err
 			}
 		}
 	}
 
 	if opts.Dir && dir != "" {
-		return doCleanDirectories(w.Filesystem, dir)
+		_, err := removeDirIfEmpty(w.filesystem, dir)
+		return err
 	}
+
 	return nil
 }
 
@@ -794,9 +1307,9 @@ func (gr GrepResult) String() string {
 	return fmt.Sprintf("%s:%s:%d:%s", gr.TreeName, gr.FileName, gr.LineNumber, gr.Content)
 }
 
-// Grep performs grep on a worktree.
-func (w *Worktree) Grep(opts *GrepOptions) ([]GrepResult, error) {
-	if err := opts.Validate(w); err != nil {
+// Grep performs grep on a repository.
+func (r *Repository) Grep(opts *GrepOptions) ([]GrepResult, error) {
+	if err := opts.validate(r); err != nil {
 		return nil, err
 	}
 
@@ -806,7 +1319,7 @@ func (w *Worktree) Grep(opts *GrepOptions) ([]GrepResult, error) {
 	var treeName string
 
 	if opts.ReferenceName != "" {
-		ref, err := w.r.Reference(opts.ReferenceName, true)
+		ref, err := r.Reference(opts.ReferenceName, true)
 		if err != nil {
 			return nil, err
 		}
@@ -819,13 +1332,18 @@ func (w *Worktree) Grep(opts *GrepOptions) ([]GrepResult, error) {
 
 	// Obtain a tree from the commit hash and get a tracked files iterator from
 	// the tree.
-	tree, err := w.getTreeFromCommitHash(commitHash)
+	tree, err := r.getTreeFromCommitHash(commitHash)
 	if err != nil {
 		return nil, err
 	}
 	fileiter := tree.Files()
 
 	return findMatchInFiles(fileiter, treeName, opts)
+}
+
+// Grep performs grep on a worktree.
+func (w *Worktree) Grep(opts *GrepOptions) ([]GrepResult, error) {
+	return w.r.Grep(opts)
 }
 
 // findMatchInFiles takes a FileIter, worktree name and GrepOptions, and
@@ -914,25 +1432,52 @@ func findMatchInFile(file *object.File, treeName string, opts *GrepOptions) ([]G
 	return grepResults, nil
 }
 
-func rmFileAndDirIfEmpty(fs billy.Filesystem, name string) error {
+// will walk up the directory tree removing all encountered empty
+// directories, not just the one containing this file
+func rmFileAndDirsIfEmpty(fs billy.Filesystem, name string) error {
 	if err := util.RemoveAll(fs, name); err != nil {
 		return err
 	}
 
 	dir := filepath.Dir(name)
-	return doCleanDirectories(fs, dir)
+	for dir != "." && dir != "" {
+		removed, err := removeDirIfEmpty(fs, dir)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		if !removed {
+			// directory was not empty and not removed,
+			// stop checking parents
+			break
+		}
+
+		// move to parent directory
+		dir = filepath.Dir(dir)
+	}
+
+	return nil
 }
 
-// doCleanDirectories removes empty subdirs (without files)
-func doCleanDirectories(fs billy.Filesystem, dir string) error {
+// removeDirIfEmpty will remove the supplied directory `dir` if
+// `dir` is empty
+// returns true if the directory was removed
+func removeDirIfEmpty(fs billy.Filesystem, dir string) (bool, error) {
 	files, err := fs.ReadDir(dir)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if len(files) == 0 {
-		return fs.Remove(dir)
+
+	if len(files) > 0 {
+		return false, nil
 	}
-	return nil
+
+	err = fs.Remove(dir)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 type indexBuilder struct {
@@ -962,4 +1507,17 @@ func (b *indexBuilder) Add(e *index.Entry) {
 
 func (b *indexBuilder) Remove(name string) {
 	delete(b.entries, filepath.ToSlash(name))
+}
+
+// buildFilePathMap creates a map of cleaned file paths for efficient lookup.
+// Returns nil if the input slice is empty.
+func buildFilePathMap(files []string) map[string]struct{} {
+	if len(files) == 0 {
+		return nil
+	}
+	filesMap := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		filesMap[filepath.Clean(f)] = struct{}{}
+	}
+	return filesMap
 }

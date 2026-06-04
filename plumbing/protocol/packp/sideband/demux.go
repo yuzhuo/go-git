@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 )
 
 // ErrMaxPackedExceeded returned by Read, if the maximum packed size is exceeded
@@ -33,7 +33,6 @@ type Progress interface {
 type Demuxer struct {
 	t Type
 	r io.Reader
-	s *pktline.Scanner
 
 	max     int
 	pending []byte
@@ -44,16 +43,15 @@ type Demuxer struct {
 
 // NewDemuxer returns a new Demuxer for the given t and read from r
 func NewDemuxer(t Type, r io.Reader) *Demuxer {
-	max := MaxPackedSize64k
+	maxSize := MaxPackedSize64k
 	if t == Sideband {
-		max = MaxPackedSize
+		maxSize = MaxPackedSize
 	}
 
 	return &Demuxer{
 		t:   t,
 		r:   r,
-		max: max,
-		s:   pktline.NewScanner(r),
+		max: maxSize,
 	}
 }
 
@@ -63,10 +61,11 @@ func NewDemuxer(t Type, r io.Reader) *Demuxer {
 //
 // When a ProgressMessage is read, is not copy to b, instead of this is written
 // to the Progress
-func (d *Demuxer) Read(b []byte) (n int, err error) {
-	var read, req int
-
-	req = len(b)
+//
+// Read will return io.EOF when a flush packet is received after reading all
+// the PackData channel data.
+func (d *Demuxer) Read(b []byte) (read int, err error) {
+	req := len(b)
 	for read < req {
 		n, err := d.doRead(b[read:req])
 		read += n
@@ -102,21 +101,22 @@ func (d *Demuxer) nextPackData() ([]byte, error) {
 		return content, nil
 	}
 
-	if !d.s.Scan() {
-		if err := d.s.Err(); err != nil {
-			return nil, err
-		}
-
-		return nil, io.EOF
+	l, p, err := pktline.ReadLine(d.r)
+	if err != nil {
+		return nil, err
 	}
 
-	content = d.s.Bytes()
-
-	size := len(content)
-	if size == 0 {
-		return nil, nil
-	} else if size > d.max {
+	content = p
+	if l == pktline.Flush {
+		// Done demultiplex sidebands. Use io.EOF to indicate the end of
+		// sideband packets.
+		return nil, io.EOF
+	} else if l > d.max {
 		return nil, ErrMaxPackedExceeded
+	}
+
+	if len(content) < 1 {
+		return nil, fmt.Errorf("invalid sideband pktline %04x %q", l, content)
 	}
 
 	switch Channel(content[0]) {

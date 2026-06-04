@@ -3,11 +3,11 @@ package main
 import (
 	"fmt"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
 // Example of how to:
@@ -20,8 +20,9 @@ import (
 func main() {
 	// Create a new repository
 	Info("git init")
-	r, err := git.Init(memory.NewStorage(), nil)
+	r, err := git.Init(memory.NewStorage())
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	// Add a new remote, with the default fetch refspec
 	Info("git remote add example https://github.com/git-fixtures/basic.git")
@@ -33,7 +34,7 @@ func main() {
 	CheckIfError(err)
 
 	// List remotes from a repository
-	Info("git remotes -v")
+	Info("git remote -v")
 
 	list, err := r.Remotes()
 	CheckIfError(err)

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
 // Dir values implement directory-like noders.
@@ -110,6 +110,10 @@ func (d *dir) Children() ([]noder.Noder, error) {
 
 func (d *dir) NumChildren() (int, error) {
 	return len(d.children), nil
+}
+
+func (d *dir) Skip() bool {
+	return false
 }
 
 const (

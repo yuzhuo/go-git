@@ -2,64 +2,69 @@ package packp
 
 import (
 	"bytes"
+	"fmt"
+	"regexp"
 	"runtime"
+	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 )
 
-type UlReqEncodeSuite struct{}
+type UlReqEncodeSuite struct {
+	suite.Suite
+}
 
-var _ = Suite(&UlReqEncodeSuite{})
+func TestUlReqEncodeSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(UlReqEncodeSuite))
+}
 
-func testUlReqEncode(c *C, ur *UploadRequest, expectedPayloads []string) {
+func testUlReqEncode(s *UlReqEncodeSuite, ur *UploadRequest, expectedPayloads []string) {
 	var buf bytes.Buffer
-	e := newUlReqEncoder(&buf)
 
-	err := e.Encode(ur)
-	c.Assert(err, IsNil)
+	err := ur.Encode(&buf)
+	s.NoError(err)
 	obtained := buf.Bytes()
 
-	expected := pktlines(c, expectedPayloads...)
+	expected := pktlines(s.T(), expectedPayloads...)
 
-	comment := Commentf("\nobtained = %s\nexpected = %s\n", string(obtained), string(expected))
+	comment := fmt.Sprintf("\nobtained = %s\nexpected = %s\n", string(obtained), string(expected))
 
-	c.Assert(obtained, DeepEquals, expected, comment)
+	s.Equal(expected, obtained, comment)
 }
 
-func testUlReqEncodeError(c *C, ur *UploadRequest, expectedErrorRegEx string) {
+func testUlReqEncodeError(s *UlReqEncodeSuite, ur *UploadRequest, expectedErrorRegEx string) {
 	var buf bytes.Buffer
-	e := newUlReqEncoder(&buf)
 
-	err := e.Encode(ur)
-	c.Assert(err, ErrorMatches, expectedErrorRegEx)
+	err := ur.Encode(&buf)
+	s.Regexp(regexp.MustCompile(expectedErrorRegEx), err)
 }
 
-func (s *UlReqEncodeSuite) TestZeroValue(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestZeroValue() {
+	ur := &UploadRequest{}
 	expectedErrorRegEx := ".*empty wants.*"
 
-	testUlReqEncodeError(c, ur, expectedErrorRegEx)
+	testUlReqEncodeError(s, ur, expectedErrorRegEx)
 }
 
-func (s *UlReqEncodeSuite) TestOneWant(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestOneWant() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestOneWantWithCapabilities(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestOneWantWithCapabilities() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	ur.Capabilities.Add(capability.MultiACK)
 	ur.Capabilities.Add(capability.OFSDelta)
@@ -69,14 +74,14 @@ func (s *UlReqEncodeSuite) TestOneWantWithCapabilities(c *C) {
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111 multi_ack ofs-delta side-band symref=HEAD:/refs/heads/master thin-pack\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestWants(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestWants() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants,
 		plumbing.NewHash("4444444444444444444444444444444444444444"),
 		plumbing.NewHash("1111111111111111111111111111111111111111"),
@@ -91,14 +96,14 @@ func (s *UlReqEncodeSuite) TestWants(c *C) {
 		"want 3333333333333333333333333333333333333333\n",
 		"want 4444444444444444444444444444444444444444\n",
 		"want 5555555555555555555555555555555555555555\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestWantsDuplicates(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestWantsDuplicates() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants,
 		plumbing.NewHash("4444444444444444444444444444444444444444"),
 		plumbing.NewHash("1111111111111111111111111111111111111111"),
@@ -113,14 +118,14 @@ func (s *UlReqEncodeSuite) TestWantsDuplicates(c *C) {
 		"want 2222222222222222222222222222222222222222\n",
 		"want 3333333333333333333333333333333333333333\n",
 		"want 4444444444444444444444444444444444444444\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestWantsWithCapabilities(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestWantsWithCapabilities() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants,
 		plumbing.NewHash("4444444444444444444444444444444444444444"),
 		plumbing.NewHash("1111111111111111111111111111111111111111"),
@@ -141,14 +146,14 @@ func (s *UlReqEncodeSuite) TestWantsWithCapabilities(c *C) {
 		"want 3333333333333333333333333333333333333333\n",
 		"want 4444444444444444444444444444444444444444\n",
 		"want 5555555555555555555555555555555555555555\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestShallow(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestShallow() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	ur.Capabilities.Add(capability.MultiACK)
 	ur.Shallows = append(ur.Shallows, plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
@@ -156,14 +161,14 @@ func (s *UlReqEncodeSuite) TestShallow(c *C) {
 	expected := []string{
 		"want 1111111111111111111111111111111111111111 multi_ack\n",
 		"shallow aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestManyShallows(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestManyShallows() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	ur.Capabilities.Add(capability.MultiACK)
 	ur.Shallows = append(ur.Shallows,
@@ -179,14 +184,14 @@ func (s *UlReqEncodeSuite) TestManyShallows(c *C) {
 		"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
 		"shallow cccccccccccccccccccccccccccccccccccccccc\n",
 		"shallow dddddddddddddddddddddddddddddddddddddddd\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestShallowsDuplicate(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestShallowsDuplicate() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	ur.Capabilities.Add(capability.MultiACK)
 	ur.Shallows = append(ur.Shallows,
@@ -201,80 +206,116 @@ func (s *UlReqEncodeSuite) TestShallowsDuplicate(c *C) {
 		"shallow aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
 		"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
 		"shallow cccccccccccccccccccccccccccccccccccccccc\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestDepthCommits(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestDepthCommits() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
-	ur.Depth = DepthCommits(1234)
+	ur.Depth = DepthRequest{Deepen: 1234}
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111\n",
 		"deepen 1234\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestDepthSinceUTC(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestDepthSinceUTC() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	since := time.Date(2015, time.January, 2, 3, 4, 5, 0, time.UTC)
-	ur.Depth = DepthSince(since)
+	ur.Depth = DepthRequest{DeepenSince: since}
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111\n",
 		"deepen-since 1420167845\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestDepthSinceNonUTC(c *C) {
+func (s *UlReqEncodeSuite) TestDepthSinceNonUTC() {
 	if runtime.GOOS == "js" {
-		c.Skip("time.LoadLocation not supported in wasm")
+		s.T().Skip("time.LoadLocation not supported in wasm")
 	}
 
-	ur := NewUploadRequest()
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
 	berlin, err := time.LoadLocation("Europe/Berlin")
-	c.Assert(err, IsNil)
+	s.NoError(err)
 	since := time.Date(2015, time.January, 2, 3, 4, 5, 0, berlin)
 	// since value is 2015-01-02 03:04:05 +0100 UTC (Europe/Berlin) or
 	// 2015-01-02 02:04:05 +0000 UTC, which is 1420164245 Unix seconds.
-	ur.Depth = DepthSince(since)
+	ur.Depth = DepthRequest{DeepenSince: since}
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111\n",
 		"deepen-since 1420164245\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestDepthReference(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestDepthReference() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
-	ur.Depth = DepthReference("refs/heads/feature-foo")
+	ur.Depth = DepthRequest{DeepenNot: []string{"refs/heads/feature-foo"}}
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111\n",
 		"deepen-not refs/heads/feature-foo\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }
 
-func (s *UlReqEncodeSuite) TestAll(c *C) {
-	ur := NewUploadRequest()
+func (s *UlReqEncodeSuite) TestDepthCommitsWithSinceError() {
+	ur := &UploadRequest{}
+	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
+	ur.Depth = DepthRequest{
+		Deepen:      10,
+		DeepenSince: time.Now(),
+	}
+
+	testUlReqEncodeError(s, ur, ".*deepen and deepen-since.*cannot be used together.*")
+}
+
+func (s *UlReqEncodeSuite) TestDepthCommitsWithNotRefsError() {
+	ur := &UploadRequest{}
+	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
+	ur.Depth = DepthRequest{
+		Deepen:    10,
+		DeepenNot: []string{"refs/heads/feature"},
+	}
+
+	testUlReqEncodeError(s, ur, ".*deepen and deepen-since.*cannot be used together.*")
+}
+
+func (s *UlReqEncodeSuite) TestFilter() {
+	ur := &UploadRequest{}
+	ur.Wants = append(ur.Wants, plumbing.NewHash("1111111111111111111111111111111111111111"))
+	ur.Filter = FilterTreeDepth(0)
+
+	expected := []string{
+		"want 1111111111111111111111111111111111111111\n",
+		"filter tree:0\n",
+		"",
+	}
+
+	testUlReqEncode(s, ur, expected)
+}
+
+func (s *UlReqEncodeSuite) TestAll() {
+	ur := &UploadRequest{}
 	ur.Wants = append(ur.Wants,
 		plumbing.NewHash("4444444444444444444444444444444444444444"),
 		plumbing.NewHash("1111111111111111111111111111111111111111"),
@@ -295,7 +336,7 @@ func (s *UlReqEncodeSuite) TestAll(c *C) {
 	ur.Shallows = append(ur.Shallows, plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 
 	since := time.Date(2015, time.January, 2, 3, 4, 5, 0, time.UTC)
-	ur.Depth = DepthSince(since)
+	ur.Depth = DepthRequest{DeepenSince: since}
 
 	expected := []string{
 		"want 1111111111111111111111111111111111111111 multi_ack ofs-delta side-band symref=HEAD:/refs/heads/master thin-pack\n",
@@ -308,8 +349,8 @@ func (s *UlReqEncodeSuite) TestAll(c *C) {
 		"shallow cccccccccccccccccccccccccccccccccccccccc\n",
 		"shallow dddddddddddddddddddddddddddddddddddddddd\n",
 		"deepen-since 1420167845\n",
-		pktline.FlushString,
+		"",
 	}
 
-	testUlReqEncode(c, ur, expected)
+	testUlReqEncode(s, ur, expected)
 }

@@ -2,99 +2,109 @@ package packp
 
 import (
 	"bytes"
+	"fmt"
+	"regexp"
+	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-type ReportStatusSuite struct{}
+type ReportStatusSuite struct {
+	suite.Suite
+}
 
-var _ = Suite(&ReportStatusSuite{})
+func TestReportStatusSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(ReportStatusSuite))
+}
 
-func (s *ReportStatusSuite) TestError(c *C) {
-	rs := NewReportStatus()
+func (s *ReportStatusSuite) TestError() {
+	rs := &ReportStatus{}
 	rs.UnpackStatus = "ok"
-	c.Assert(rs.Error(), IsNil)
+	s.Nil(rs.Error())
 	rs.UnpackStatus = "OK"
-	c.Assert(rs.Error(), ErrorMatches, "unpack error: OK")
+	s.Regexp(regexp.MustCompile("unpack error: OK"), rs.Error())
 	rs.UnpackStatus = ""
-	c.Assert(rs.Error(), ErrorMatches, "unpack error: ")
+	s.Regexp(regexp.MustCompile("unpack error: "), rs.Error())
 
 	cs := &CommandStatus{ReferenceName: plumbing.ReferenceName("ref")}
 	rs.UnpackStatus = "ok"
 	rs.CommandStatuses = append(rs.CommandStatuses, cs)
 
 	cs.Status = "ok"
-	c.Assert(rs.Error(), IsNil)
+	s.NoError(rs.Error())
 	cs.Status = "OK"
-	c.Assert(rs.Error(), ErrorMatches, "command error on ref: OK")
+	// According to git protocol, if unpack status is "ok", the overall status
+	// is ok even if some command statuses have errors. However, canonical Git
+	// still errors on the first received command-status error.
+	s.Regexp(regexp.MustCompile("command error on ref: OK"), rs.Error())
 	cs.Status = ""
-	c.Assert(rs.Error(), ErrorMatches, "command error on ref: ")
+	s.Regexp(regexp.MustCompile("command error on ref: "), rs.Error())
 }
 
-func (s *ReportStatusSuite) testEncodeDecodeOk(c *C, rs *ReportStatus, lines ...string) {
-	s.testDecodeOk(c, rs, lines...)
-	s.testEncodeOk(c, rs, lines...)
+func (s *ReportStatusSuite) testEncodeDecodeOk(rs *ReportStatus, lines ...string) {
+	s.testDecodeOk(rs, lines...)
+	s.testEncodeOk(rs, lines...)
 }
 
-func (s *ReportStatusSuite) testDecodeOk(c *C, expected *ReportStatus, lines ...string) {
-	r := toPktLines(c, lines)
-	rs := NewReportStatus()
-	c.Assert(rs.Decode(r), IsNil)
-	c.Assert(rs, DeepEquals, expected)
+func (s *ReportStatusSuite) testDecodeOk(expected *ReportStatus, lines ...string) {
+	r := toPktLines(s.T(), lines)
+	rs := &ReportStatus{}
+	s.Nil(rs.Decode(r))
+	s.Equal(expected, rs)
 }
 
-func (s *ReportStatusSuite) testDecodeError(c *C, errorMatch string, lines ...string) {
-	r := toPktLines(c, lines)
-	rs := NewReportStatus()
-	c.Assert(rs.Decode(r), ErrorMatches, errorMatch)
+func (s *ReportStatusSuite) testDecodeError(errorMatch string, lines ...string) {
+	r := toPktLines(s.T(), lines)
+	rs := &ReportStatus{}
+	s.Regexp(regexp.MustCompile(errorMatch), rs.Decode(r))
 }
 
-func (s *ReportStatusSuite) testEncodeOk(c *C, input *ReportStatus, lines ...string) {
-	expected := pktlines(c, lines...)
+func (s *ReportStatusSuite) testEncodeOk(input *ReportStatus, lines ...string) {
+	expected := pktlines(s.T(), lines...)
 	var buf bytes.Buffer
-	c.Assert(input.Encode(&buf), IsNil)
+	s.Nil(input.Encode(&buf))
 	obtained := buf.Bytes()
 
-	comment := Commentf("\nobtained = %s\nexpected = %s\n", string(obtained), string(expected))
+	comment := fmt.Sprintf("\nobtained = %s\nexpected = %s\n", string(obtained), string(expected))
 
-	c.Assert(obtained, DeepEquals, expected, comment)
+	s.Equal(expected, obtained, comment)
 }
 
-func (s *ReportStatusSuite) TestEncodeDecodeOkOneReference(c *C) {
-	rs := NewReportStatus()
+func (s *ReportStatusSuite) TestEncodeDecodeOkOneReference() {
+	rs := &ReportStatus{}
 	rs.UnpackStatus = "ok"
 	rs.CommandStatuses = []*CommandStatus{{
 		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
 		Status:        "ok",
 	}}
 
-	s.testEncodeDecodeOk(c, rs,
+	s.testEncodeDecodeOk(rs,
 		"unpack ok\n",
 		"ok refs/heads/master\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestEncodeDecodeOkOneReferenceFailed(c *C) {
-	rs := NewReportStatus()
+func (s *ReportStatusSuite) TestEncodeDecodeOkOneReferenceFailed() {
+	rs := &ReportStatus{}
 	rs.UnpackStatus = "my error"
 	rs.CommandStatuses = []*CommandStatus{{
 		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
 		Status:        "command error",
 	}}
 
-	s.testEncodeDecodeOk(c, rs,
+	s.testEncodeDecodeOk(rs,
 		"unpack my error\n",
 		"ng refs/heads/master command error\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferences(c *C) {
-	rs := NewReportStatus()
+func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferences() {
+	rs := &ReportStatus{}
 	rs.UnpackStatus = "ok"
 	rs.CommandStatuses = []*CommandStatus{{
 		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
@@ -107,17 +117,17 @@ func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferences(c *C) {
 		Status:        "ok",
 	}}
 
-	s.testEncodeDecodeOk(c, rs,
+	s.testEncodeDecodeOk(rs,
 		"unpack ok\n",
 		"ok refs/heads/master\n",
 		"ok refs/heads/a\n",
 		"ok refs/heads/b\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferencesFailed(c *C) {
-	rs := NewReportStatus()
+func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferencesFailed() {
+	rs := &ReportStatus{}
 	rs.UnpackStatus = "my error"
 	rs.CommandStatuses = []*CommandStatus{{
 		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
@@ -130,127 +140,127 @@ func (s *ReportStatusSuite) TestEncodeDecodeOkMoreReferencesFailed(c *C) {
 		Status:        "ok",
 	}}
 
-	s.testEncodeDecodeOk(c, rs,
+	s.testEncodeDecodeOk(rs,
 		"unpack my error\n",
 		"ok refs/heads/master\n",
 		"ng refs/heads/a command error\n",
 		"ok refs/heads/b\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestEncodeDecodeOkNoReferences(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-
-	s.testEncodeDecodeOk(c, expected,
-		"unpack ok\n",
-		pktline.FlushString,
-	)
-}
-
-func (s *ReportStatusSuite) TestEncodeDecodeOkNoReferencesFailed(c *C) {
-	rs := NewReportStatus()
-	rs.UnpackStatus = "my error"
-
-	s.testEncodeDecodeOk(c, rs,
-		"unpack my error\n",
-		pktline.FlushString,
-	)
-}
-
-func (s *ReportStatusSuite) TestDecodeErrorOneReferenceNoFlush(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
+func (s *ReportStatusSuite) TestEncodeDecodeOkUnpackWithFailedCommands() {
+	rs := &ReportStatus{}
+	rs.UnpackStatus = "ok"
+	rs.CommandStatuses = []*CommandStatus{{
 		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
+		Status:        "ok",
+	}, {
+		ReferenceName: plumbing.ReferenceName("refs/heads/a"),
+		Status:        "command error",
+	}, {
+		ReferenceName: plumbing.ReferenceName("refs/heads/b"),
 		Status:        "ok",
 	}}
 
-	s.testDecodeError(c, "missing flush",
+	s.testEncodeDecodeOk(rs,
+		"unpack ok\n",
+		"ok refs/heads/master\n",
+		"ng refs/heads/a command error\n",
+		"ok refs/heads/b\n",
+		"",
+	)
+
+	s.Error(rs.Error())
+	s.ErrorAs(rs.Error(), &CommandStatusErr{})
+}
+
+func (s *ReportStatusSuite) TestEncodeDecodeOkNoReferences() {
+	expected := &ReportStatus{}
+	expected.UnpackStatus = "ok"
+
+	s.testEncodeDecodeOk(expected,
+		"unpack ok\n",
+		"",
+	)
+}
+
+func (s *ReportStatusSuite) TestEncodeDecodeOkNoReferencesFailed() {
+	rs := &ReportStatus{}
+	rs.UnpackStatus = "my error"
+
+	s.testEncodeDecodeOk(rs,
+		"unpack my error\n",
+		"",
+	)
+}
+
+func (s *ReportStatusSuite) TestDecodeErrorOneReferenceNoFlush() {
+	s.testDecodeError("missing flush",
 		"unpack ok\n",
 		"ok refs/heads/master\n",
 	)
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorEmpty(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "unexpected EOF")
+func (s *ReportStatusSuite) TestDecodeErrorEmpty() {
+	s.testDecodeError("unexpected EOF")
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorMalformed(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "malformed unpack status: unpackok",
+func (s *ReportStatusSuite) TestDecodeErrorMalformed() {
+	s.testDecodeError("malformed unpack status: unpackok",
 		"unpackok\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorMalformed2(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "malformed unpack status: UNPACK OK",
+func (s *ReportStatusSuite) TestDecodeErrorMalformed2() {
+	s.testDecodeError("malformed unpack status: UNPACK OK",
 		"UNPACK OK\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorMalformedCommandStatus(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "malformed command status: ko refs/heads/master",
+func (s *ReportStatusSuite) TestDecodeErrorMalformedCommandStatus() {
+	s.testDecodeError("malformed command status: ko refs/heads/master",
 		"unpack ok\n",
 		"ko refs/heads/master\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorMalformedCommandStatus2(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "malformed command status: ng refs/heads/master",
+func (s *ReportStatusSuite) TestDecodeErrorMalformedCommandStatus2() {
+	s.testDecodeError("malformed command status: ng refs/heads/master",
 		"unpack ok\n",
 		"ng refs/heads/master\n",
-		pktline.FlushString,
+		"",
 	)
 }
 
-func (s *ReportStatusSuite) TestDecodeErrorPrematureFlush(c *C) {
-	expected := NewReportStatus()
-	expected.UnpackStatus = "ok"
-	expected.CommandStatuses = []*CommandStatus{{
-		ReferenceName: plumbing.ReferenceName("refs/heads/master"),
-		Status:        "ok",
-	}}
-
-	s.testDecodeError(c, "premature flush",
-		pktline.FlushString,
+func (s *ReportStatusSuite) TestDecodeErrorPrematureFlush() {
+	s.testDecodeError("premature flush",
+		"",
 	)
+}
+
+func (s *ReportStatusSuite) TestCommandStatusError() {
+	// Test that individual CommandStatus objects still report errors correctly
+	cs := &CommandStatus{ReferenceName: plumbing.ReferenceName("refs/heads/master")}
+
+	cs.Status = "ok"
+	s.NoError(cs.Error())
+
+	cs.Status = "command error"
+	s.Error(cs.Error())
+	s.Regexp(regexp.MustCompile("command error on refs/heads/master: command error"), cs.Error())
+
+	// Create a ReportStatus with a failed command but ok unpack status
+	rs := &ReportStatus{}
+	rs.UnpackStatus = "ok"
+	rs.CommandStatuses = append(rs.CommandStatuses, cs)
+
+	// Verify that ReportStatus.Error() returns a [CommandStatusErr] error.
+	s.Error(rs.Error())
+	s.ErrorAs(rs.Error(), &CommandStatusErr{})
+	s.Error(cs.Error())
+	s.ErrorAs(cs.Error(), &CommandStatusErr{})
 }

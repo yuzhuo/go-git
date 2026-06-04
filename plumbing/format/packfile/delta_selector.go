@@ -4,8 +4,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 const (
@@ -20,12 +20,23 @@ var applyDelta = map[plumbing.ObjectType]bool{
 	plumbing.TreeObject: true,
 }
 
-type deltaSelector struct {
+// DeltaSelector decides which objects in a pack will be encoded as
+// deltas and against which base, using a sliding window over the
+// object set. It is the default object selector used by Encoder.
+//
+// Callers can also run a DeltaSelector ahead of time and feed the
+// result back into an Encoder via WithObjectSelector + a passthrough
+// ObjectSelector, so the pack-write phase can stream output without
+// an internal delay during selection. This is useful when the
+// encoder's writer is something like an HTTP request body where
+// mid-stream stalls trip server timeouts.
+type DeltaSelector struct {
 	storer storer.EncodedObjectStorer
 }
 
-func newDeltaSelector(s storer.EncodedObjectStorer) *deltaSelector {
-	return &deltaSelector{s}
+// NewDeltaSelector returns a DeltaSelector backed by s.
+func NewDeltaSelector(s storer.EncodedObjectStorer) *DeltaSelector {
+	return &DeltaSelector{s}
 }
 
 // ObjectsToPack creates a list of ObjectToPack from the hashes
@@ -33,7 +44,7 @@ func newDeltaSelector(s storer.EncodedObjectStorer) *deltaSelector {
 // internal logic.  `packWindow` specifies the size of the sliding
 // window used to compare objects for delta compression; 0 turns off
 // delta compression entirely.
-func (dw *deltaSelector) ObjectsToPack(
+func (dw *DeltaSelector) ObjectsToPack(
 	hashes []plumbing.Hash,
 	packWindow uint,
 ) ([]*ObjectToPack, error) {
@@ -64,16 +75,13 @@ func (dw *deltaSelector) ObjectsToPack(
 	var wg sync.WaitGroup
 	var once sync.Once
 	for _, objs := range objectGroups {
-		objs := objs
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			if walkErr := dw.walk(objs, packWindow); walkErr != nil {
 				once.Do(func() {
 					err = walkErr
 				})
 			}
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -84,11 +92,11 @@ func (dw *deltaSelector) ObjectsToPack(
 	return otp, nil
 }
 
-func (dw *deltaSelector) objectsToPack(
+func (dw *DeltaSelector) objectsToPack(
 	hashes []plumbing.Hash,
 	packWindow uint,
 ) ([]*ObjectToPack, error) {
-	var objectsToPack []*ObjectToPack
+	objectsToPack := make([]*ObjectToPack, 0, len(hashes))
 	for _, h := range hashes {
 		var o plumbing.EncodedObject
 		var err error
@@ -120,7 +128,7 @@ func (dw *deltaSelector) objectsToPack(
 	return objectsToPack, nil
 }
 
-func (dw *deltaSelector) encodedDeltaObject(h plumbing.Hash) (plumbing.EncodedObject, error) {
+func (dw *DeltaSelector) encodedDeltaObject(h plumbing.Hash) (plumbing.EncodedObject, error) {
 	edos, ok := dw.storer.(storer.DeltaObjectStorer)
 	if !ok {
 		return dw.encodedObject(h)
@@ -129,11 +137,11 @@ func (dw *deltaSelector) encodedDeltaObject(h plumbing.Hash) (plumbing.EncodedOb
 	return edos.DeltaObject(plumbing.AnyObject, h)
 }
 
-func (dw *deltaSelector) encodedObject(h plumbing.Hash) (plumbing.EncodedObject, error) {
+func (dw *DeltaSelector) encodedObject(h plumbing.Hash) (plumbing.EncodedObject, error) {
 	return dw.storer.EncodedObject(plumbing.AnyObject, h)
 }
 
-func (dw *deltaSelector) fixAndBreakChains(objectsToPack []*ObjectToPack) error {
+func (dw *DeltaSelector) fixAndBreakChains(objectsToPack []*ObjectToPack) error {
 	m := make(map[plumbing.Hash]*ObjectToPack, len(objectsToPack))
 	for _, otp := range objectsToPack {
 		m[otp.Hash()] = otp
@@ -148,7 +156,7 @@ func (dw *deltaSelector) fixAndBreakChains(objectsToPack []*ObjectToPack) error 
 	return nil
 }
 
-func (dw *deltaSelector) fixAndBreakChainsOne(objectsToPack map[plumbing.Hash]*ObjectToPack, otp *ObjectToPack) error {
+func (dw *DeltaSelector) fixAndBreakChainsOne(objectsToPack map[plumbing.Hash]*ObjectToPack, otp *ObjectToPack) error {
 	if !otp.Object.Type().IsDelta() {
 		return nil
 	}
@@ -182,7 +190,7 @@ func (dw *deltaSelector) fixAndBreakChainsOne(objectsToPack map[plumbing.Hash]*O
 	return nil
 }
 
-func (dw *deltaSelector) restoreOriginal(otp *ObjectToPack) error {
+func (dw *DeltaSelector) restoreOriginal(otp *ObjectToPack) error {
 	if otp.Original != nil {
 		return nil
 	}
@@ -203,7 +211,7 @@ func (dw *deltaSelector) restoreOriginal(otp *ObjectToPack) error {
 
 // undeltify undeltifies an *ObjectToPack by retrieving the original object from
 // the storer and resetting it.
-func (dw *deltaSelector) undeltify(otp *ObjectToPack) error {
+func (dw *DeltaSelector) undeltify(otp *ObjectToPack) error {
 	if err := dw.restoreOriginal(otp); err != nil {
 		return err
 	}
@@ -213,16 +221,16 @@ func (dw *deltaSelector) undeltify(otp *ObjectToPack) error {
 	return nil
 }
 
-func (dw *deltaSelector) sort(objectsToPack []*ObjectToPack) {
+func (dw *DeltaSelector) sort(objectsToPack []*ObjectToPack) {
 	sort.Sort(byTypeAndSize(objectsToPack))
 }
 
-func (dw *deltaSelector) walk(
+func (dw *DeltaSelector) walk(
 	objectsToPack []*ObjectToPack,
 	packWindow uint,
 ) error {
 	indexMap := make(map[plumbing.Hash]*deltaIndex)
-	for i := 0; i < len(objectsToPack); i++ {
+	for i := range len(objectsToPack) {
 		// Clean up the index map and reconstructed delta objects for anything
 		// outside our pack window, to save memory.
 		if i > int(packWindow) {
@@ -268,7 +276,7 @@ func (dw *deltaSelector) walk(
 	return nil
 }
 
-func (dw *deltaSelector) tryToDeltify(indexMap map[plumbing.Hash]*deltaIndex, base, target *ObjectToPack) error {
+func (dw *DeltaSelector) tryToDeltify(indexMap map[plumbing.Hash]*deltaIndex, base, target *ObjectToPack) error {
 	// Original object might not be present if we're reusing a delta, so we
 	// ensure it is restored.
 	if err := dw.restoreOriginal(target); err != nil {
@@ -319,8 +327,9 @@ func (dw *deltaSelector) tryToDeltify(indexMap map[plumbing.Hash]*deltaIndex, ba
 	return nil
 }
 
-func (dw *deltaSelector) deltaSizeLimit(targetSize int64, baseDepth int,
-	targetDepth int, targetDelta bool) int64 {
+func (dw *DeltaSelector) deltaSizeLimit(targetSize int64, baseDepth int,
+	targetDepth int, targetDelta bool,
+) int64 {
 	if !targetDelta {
 		// Any delta should be no more than 50% of the original size
 		// (for text files deflate of whole form should shrink 50%).

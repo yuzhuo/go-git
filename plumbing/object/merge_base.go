@@ -1,11 +1,12 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 // errIsReachable is thrown when first commit is an ancestor of the second
@@ -21,7 +22,7 @@ func (c *Commit) MergeBase(other *Commit) ([]*Commit, error) {
 	older := sorted[1]
 
 	newerHistory, err := ancestorsIndex(older, newer)
-	if err == errIsReachable {
+	if errors.Is(err, errIsReachable) {
 		return []*Commit{older}, nil
 	}
 
@@ -76,7 +77,6 @@ func ancestorsIndex(excluded, starting *Commit) (map[plumbing.Hash]struct{}, err
 		startingHistory[commit.Hash] = struct{}{}
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +121,6 @@ func Independents(commits []*Commit) ([]*Commit, error) {
 			seen[fromAncestor.Hash] = struct{}{}
 			return nil
 		})
-
 		if err != nil {
 			return nil, err
 		}

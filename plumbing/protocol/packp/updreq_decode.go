@@ -2,45 +2,40 @@ package packp
 
 import (
 	"bytes"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 )
 
 var (
-	shallowLineLength       = len(shallow) + hashSize
-	minCommandLength        = hashSize*2 + 2 + 1
+	minCommandLength        = sha1HexSize*2 + 2 + 1
 	minCommandAndCapsLength = minCommandLength + 1
 )
 
+// Decode errors.
 var (
 	ErrEmpty                        = errors.New("empty update-request message")
 	errNoCommands                   = errors.New("unexpected EOF before any command")
 	errMissingCapabilitiesDelimiter = errors.New("capabilities delimiter not found")
+	errNoFlush                      = errors.New("unexpected EOF before flush line")
 )
 
 func errMalformedRequest(reason string) error {
 	return fmt.Errorf("malformed request: %s", reason)
 }
 
-func errInvalidHashSize(got int) error {
-	return fmt.Errorf("invalid hash size: expected %d, got %d",
-		hashSize, got)
-}
-
-func errInvalidHash(err error) error {
-	return fmt.Errorf("invalid hash: %s", err.Error())
+func errInvalidHash(hash string) error {
+	return fmt.Errorf("invalid hash: %s", hash)
 }
 
 func errInvalidShallowLineLength(got int) error {
 	return errMalformedRequest(fmt.Sprintf(
-		"invalid shallow line length: expected %d, got %d",
-		shallowLineLength, got))
+		"invalid shallow line length: expected %d or %d, got %d",
+		len(shallow)+sha1HexSize, len(shallow)+sha256HexSize, got))
 }
 
 func errInvalidCommandCapabilitiesLineLength(got int) error {
@@ -55,17 +50,17 @@ func errInvalidCommandLineLength(got int) error {
 		minCommandLength, got))
 }
 
-func errInvalidShallowObjId(err error) error {
+func errInvalidShallowObjID(err error) error {
 	return errMalformedRequest(
 		fmt.Sprintf("invalid shallow object id: %s", err.Error()))
 }
 
-func errInvalidOldObjId(err error) error {
+func errInvalidOldObjID(err error) error {
 	return errMalformedRequest(
 		fmt.Sprintf("invalid old object id: %s", err.Error()))
 }
 
-func errInvalidNewObjId(err error) error {
+func errInvalidNewObjID(err error) error {
 	return errMalformedRequest(
 		fmt.Sprintf("invalid new object id: %s", err.Error()))
 }
@@ -75,131 +70,97 @@ func errMalformedCommand(err error) error {
 		"malformed command: %s", err.Error()))
 }
 
-// Decode reads the next update-request message form the reader and wr
-func (req *ReferenceUpdateRequest) Decode(r io.Reader) error {
-	var rc io.ReadCloser
-	var ok bool
-	rc, ok = r.(io.ReadCloser)
-	if !ok {
-		rc = ioutil.NopCloser(r)
-	}
+// Decode reads the next update-request message from the reader.
+func (req *UpdateRequests) Decode(r io.Reader) error {
+	var (
+		payload []byte
+		length  int
+	)
 
-	d := &updReqDecoder{r: rc, s: pktline.NewScanner(r)}
-	return d.Decode(req)
-}
-
-type updReqDecoder struct {
-	r   io.ReadCloser
-	s   *pktline.Scanner
-	req *ReferenceUpdateRequest
-}
-
-func (d *updReqDecoder) Decode(req *ReferenceUpdateRequest) error {
-	d.req = req
-	funcs := []func() error{
-		d.scanLine,
-		d.decodeShallow,
-		d.decodeCommandAndCapabilities,
-		d.decodeCommands,
-		d.setPackfile,
-		req.validate,
-	}
-
-	for _, f := range funcs {
-		if err := f(); err != nil {
-			return err
+	readLine := func(eofErr error) error {
+		l, p, err := pktline.ReadLine(r)
+		if errors.Is(err, io.EOF) {
+			return eofErr
 		}
-	}
-
-	return nil
-}
-
-func (d *updReqDecoder) scanLine() error {
-	if ok := d.s.Scan(); !ok {
-		return d.scanErrorOr(ErrEmpty)
-	}
-
-	return nil
-}
-
-func (d *updReqDecoder) decodeShallow() error {
-	b := d.s.Bytes()
-
-	if !bytes.HasPrefix(b, shallowNoSp) {
-		return nil
-	}
-
-	if len(b) != shallowLineLength {
-		return errInvalidShallowLineLength(len(b))
-	}
-
-	h, err := parseHash(string(b[len(shallow):]))
-	if err != nil {
-		return errInvalidShallowObjId(err)
-	}
-
-	if ok := d.s.Scan(); !ok {
-		return d.scanErrorOr(errNoCommands)
-	}
-
-	d.req.Shallow = &h
-
-	return nil
-}
-
-func (d *updReqDecoder) decodeCommands() error {
-	for {
-		b := d.s.Bytes()
-		if bytes.Equal(b, pktline.Flush) {
-			return nil
-		}
-
-		c, err := parseCommand(b)
 		if err != nil {
 			return err
 		}
+		payload = p
+		length = l
+		return nil
+	}
 
-		d.req.Commands = append(d.req.Commands, c)
+	// Scan first line
+	if err := readLine(ErrEmpty); err != nil {
+		return err
+	}
 
-		if ok := d.s.Scan(); !ok {
-			return d.s.Err()
+	// Process all consecutive shallow lines
+	for {
+		b := bytes.TrimSuffix(payload, eol)
+		if !bytes.HasPrefix(b, shallowNoSp) {
+			break
+		}
+
+		hashLen := len(b) - len(shallow)
+		if hashLen != sha1HexSize && hashLen != sha256HexSize {
+			return errInvalidShallowLineLength(len(b))
+		}
+
+		h, err := parseHash(string(b[len(shallow):]))
+		if err != nil {
+			return errInvalidShallowObjID(err)
+		}
+		req.Shallows = append(req.Shallows, h)
+
+		if err := readLine(errNoCommands); err != nil {
+			return err
 		}
 	}
-}
 
-func (d *updReqDecoder) decodeCommandAndCapabilities() error {
-	b := d.s.Bytes()
-	i := bytes.IndexByte(b, 0)
-	if i == -1 {
+	// The first command line must contain capabilities separated by a null byte
+	before, after, ok := bytes.Cut(payload, []byte{0})
+	if !ok {
 		return errMissingCapabilitiesDelimiter
 	}
-
-	if len(b) < minCommandAndCapsLength {
-		return errInvalidCommandCapabilitiesLineLength(len(b))
+	if len(payload) < minCommandAndCapsLength {
+		return errInvalidCommandCapabilitiesLineLength(len(payload))
 	}
 
-	cmd, err := parseCommand(b[:i])
+	// Extract and decode capabilities (everything after the null byte)
+	capability.DecodeList(after, &req.Capabilities)
+
+	// Extract the command (everything before the null byte)
+	cmd, err := parseCommand(before)
 	if err != nil {
 		return err
 	}
+	req.Commands = append(req.Commands, cmd)
 
-	d.req.Commands = append(d.req.Commands, cmd)
+	// Read and process remaining commands
+	for {
+		if err := readLine(errNoFlush); err != nil {
+			return err
+		}
 
-	if err := d.req.Capabilities.Decode(b[i+1:]); err != nil {
-		return err
+		// Stop reading once we reach the flush line
+		if length == pktline.Flush {
+			break
+		}
+
+		cmd, err := parseCommand(payload)
+		if err != nil {
+			return err
+		}
+		req.Commands = append(req.Commands, cmd)
 	}
 
-	if err := d.scanLine(); err != nil {
-		return err
+	// We should always have a flush line at the end of the request.
+	if len(payload) != 0 || length != pktline.Flush {
+		return errMalformedRequest("unexpected data after flush")
 	}
 
-	return nil
-}
-
-func (d *updReqDecoder) setPackfile() error {
-	d.req.Packfile = d.r
-
-	return nil
+	return validateUpdateRequests(req)
 }
 
 func parseCommand(b []byte) (*Command, error) {
@@ -217,34 +178,22 @@ func parseCommand(b []byte) (*Command, error) {
 
 	oh, err := parseHash(os)
 	if err != nil {
-		return nil, errInvalidOldObjId(err)
+		return nil, errInvalidOldObjID(err)
 	}
 
 	nh, err := parseHash(ns)
 	if err != nil {
-		return nil, errInvalidNewObjId(err)
+		return nil, errInvalidNewObjID(err)
 	}
 
 	return &Command{Old: oh, New: nh, Name: n}, nil
 }
 
 func parseHash(s string) (plumbing.Hash, error) {
-	if len(s) != hashSize {
-		return plumbing.ZeroHash, errInvalidHashSize(len(s))
+	h, ok := plumbing.FromHex(s)
+	if !ok {
+		return plumbing.ZeroHash, errInvalidHash(s)
 	}
 
-	if _, err := hex.DecodeString(s); err != nil {
-		return plumbing.ZeroHash, errInvalidHash(err)
-	}
-
-	h := plumbing.NewHash(s)
 	return h, nil
-}
-
-func (d *updReqDecoder) scanErrorOr(origErr error) error {
-	if err := d.s.Err(); err != nil {
-		return err
-	}
-
-	return origErr
 }

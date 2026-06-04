@@ -2,24 +2,28 @@ package index
 
 import (
 	"bytes"
-	"path/filepath"
+	"path"
 	"testing"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/index"
-	"github.com/go-git/go-git/v5/utils/merkletrie"
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/stretchr/testify/suite"
 
-	. "gopkg.in/check.v1"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/plumbing/format/index"
+	"github.com/go-git/go-git/v6/utils/merkletrie"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
-func Test(t *testing.T) { TestingT(t) }
+type NoderSuite struct {
+	suite.Suite
+}
 
-type NoderSuite struct{}
+func TestNoderSuite(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(NoderSuite))
+}
 
-var _ = Suite(&NoderSuite{})
-
-func (s *NoderSuite) TestDiff(c *C) {
+func (s *NoderSuite) TestDiff() {
 	indexA := &index.Index{
 		Entries: []*index.Entry{
 			{Name: "foo", Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d")},
@@ -39,31 +43,57 @@ func (s *NoderSuite) TestDiff(c *C) {
 	}
 
 	ch, err := merkletrie.DiffTree(NewRootNode(indexA), NewRootNode(indexB), isEquals)
-	c.Assert(err, IsNil)
-	c.Assert(ch, HasLen, 0)
+	s.NoError(err)
+	s.Len(ch, 0)
 }
 
-func (s *NoderSuite) TestDiffChange(c *C) {
+func (s *NoderSuite) TestDiffChange() {
 	indexA := &index.Index{
 		Entries: []*index.Entry{{
-			Name: filepath.Join("bar", "baz", "bar"),
+			Name: path.Join("bar", "baz", "bar"),
 			Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
 		}},
 	}
 
 	indexB := &index.Index{
 		Entries: []*index.Entry{{
-			Name: filepath.Join("bar", "baz", "foo"),
+			Name: path.Join("bar", "baz", "foo"),
 			Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
 		}},
 	}
 
 	ch, err := merkletrie.DiffTree(NewRootNode(indexA), NewRootNode(indexB), isEquals)
-	c.Assert(err, IsNil)
-	c.Assert(ch, HasLen, 2)
+	s.NoError(err)
+	s.Len(ch, 2)
 }
 
-func (s *NoderSuite) TestDiffDir(c *C) {
+func (s *NoderSuite) TestDiffSkipIssue1455() {
+	indexA := &index.Index{
+		Entries: []*index.Entry{
+			{
+				Name:         path.Join("bar", "baz", "bar"),
+				Hash:         plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
+				SkipWorktree: true,
+			},
+			{
+				Name:         path.Join("bar", "biz", "bat"),
+				Hash:         plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
+				SkipWorktree: false,
+			},
+		},
+	}
+
+	indexB := &index.Index{}
+
+	ch, err := merkletrie.DiffTree(NewRootNode(indexB), NewRootNode(indexA), isEquals)
+	s.NoError(err)
+	s.Len(ch, 1)
+	a, err := ch[0].Action()
+	s.NoError(err)
+	s.Equal(a, merkletrie.Insert)
+}
+
+func (s *NoderSuite) TestDiffDir() {
 	indexA := &index.Index{
 		Entries: []*index.Entry{{
 			Name: "foo",
@@ -73,17 +103,17 @@ func (s *NoderSuite) TestDiffDir(c *C) {
 
 	indexB := &index.Index{
 		Entries: []*index.Entry{{
-			Name: filepath.Join("foo", "bar"),
+			Name: path.Join("foo", "bar"),
 			Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
 		}},
 	}
 
 	ch, err := merkletrie.DiffTree(NewRootNode(indexA), NewRootNode(indexB), isEquals)
-	c.Assert(err, IsNil)
-	c.Assert(ch, HasLen, 2)
+	s.NoError(err)
+	s.Len(ch, 2)
 }
 
-func (s *NoderSuite) TestDiffSameRoot(c *C) {
+func (s *NoderSuite) TestDiffSameRoot() {
 	indexA := &index.Index{
 		Entries: []*index.Entry{
 			{Name: "foo.go", Hash: plumbing.NewHash("aab686eafeb1f44702738c8b0f24f2567c36da6d")},
@@ -99,8 +129,39 @@ func (s *NoderSuite) TestDiffSameRoot(c *C) {
 	}
 
 	ch, err := merkletrie.DiffTree(NewRootNode(indexA), NewRootNode(indexB), isEquals)
-	c.Assert(err, IsNil)
-	c.Assert(ch, HasLen, 1)
+	s.NoError(err)
+	s.Len(ch, 1)
+}
+
+func (s *NoderSuite) TestDiffFileMode() {
+	indexA := &index.Index{
+		Entries: []*index.Entry{{
+			Name: "foo.bash",
+			Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
+			Mode: filemode.Executable,
+		}},
+	}
+
+	indexB := &index.Index{
+		Entries: []*index.Entry{{
+			Name: "foo.bash",
+			Hash: plumbing.NewHash("8ab686eafeb1f44702738c8b0f24f2567c36da6d"),
+			Mode: filemode.Regular,
+		}},
+	}
+
+	// filemode is false
+	ch, err := merkletrie.DiffTree(
+		NewRootNodeWithOptions(indexA, RootNodeOptions{}),
+		NewRootNodeWithOptions(indexB, RootNodeOptions{}),
+		isEquals)
+	s.NoError(err)
+	s.Len(ch, 0)
+
+	// filemode is true
+	ch, err = merkletrie.DiffTree(NewRootNode(indexA), NewRootNode(indexB), isEquals)
+	s.NoError(err)
+	s.Len(ch, 1)
 }
 
 var empty = make([]byte, 24)

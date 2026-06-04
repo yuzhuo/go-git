@@ -2,38 +2,58 @@ package packp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 )
 
 const (
 	ok = "ok"
 )
 
+// UnpackStatusErr is the error returned when the report status is not ok.
+type UnpackStatusErr struct {
+	Status string
+}
+
+// Error implements the error interface.
+func (e UnpackStatusErr) Error() string {
+	return fmt.Sprintf("unpack error: %s", e.Status)
+}
+
+// CommandStatusErr is the error returned when the command status is not ok.
+type CommandStatusErr struct {
+	ReferenceName plumbing.ReferenceName
+	Status        string
+}
+
+// Error implements the error interface.
+func (e CommandStatusErr) Error() string {
+	return fmt.Sprintf("command error on %s: %s", e.ReferenceName.String(), e.Status)
+}
+
 // ReportStatus is a report status message, as used in the git-receive-pack
 // process whenever the 'report-status' capability is negotiated.
+// The zero value is safe to use.
 type ReportStatus struct {
 	UnpackStatus    string
 	CommandStatuses []*CommandStatus
 }
 
-// NewReportStatus creates a new ReportStatus message.
-func NewReportStatus() *ReportStatus {
-	return &ReportStatus{}
-}
-
 // Error returns the first error if any.
 func (s *ReportStatus) Error() error {
 	if s.UnpackStatus != ok {
-		return fmt.Errorf("unpack error: %s", s.UnpackStatus)
+		return UnpackStatusErr{s.UnpackStatus}
 	}
 
-	for _, s := range s.CommandStatuses {
-		if err := s.Error(); err != nil {
+	for _, cs := range s.CommandStatuses {
+		if err := cs.Error(); err != nil {
+			// XXX: Here, we only return the first error following canonical
+			// Git behavior.
 			return err
 		}
 	}
@@ -43,8 +63,7 @@ func (s *ReportStatus) Error() error {
 
 // Encode writes the report status to a writer.
 func (s *ReportStatus) Encode(w io.Writer) error {
-	e := pktline.NewEncoder(w)
-	if err := e.Encodef("unpack %s\n", s.UnpackStatus); err != nil {
+	if _, err := pktline.Writef(w, "unpack %s\n", s.UnpackStatus); err != nil {
 		return err
 	}
 
@@ -54,25 +73,30 @@ func (s *ReportStatus) Encode(w io.Writer) error {
 		}
 	}
 
-	return e.Flush()
+	return pktline.WriteFlush(w)
 }
 
 // Decode reads from the given reader and decodes a report-status message. It
 // does not read more input than what is needed to fill the report status.
 func (s *ReportStatus) Decode(r io.Reader) error {
-	scan := pktline.NewScanner(r)
-	if err := s.scanFirstLine(scan); err != nil {
+	b, err := s.scanFirstLine(r)
+	if err != nil {
 		return err
 	}
 
-	if err := s.decodeReportStatus(scan.Bytes()); err != nil {
+	if err := s.decodeReportStatus(b); err != nil {
 		return err
 	}
 
+	var l int
 	flushed := false
-	for scan.Scan() {
-		b := scan.Bytes()
-		if isFlush(b) {
+	for {
+		l, b, err = pktline.ReadLine(r)
+		if err != nil {
+			break
+		}
+
+		if l == pktline.Flush {
 			flushed = true
 			break
 		}
@@ -83,22 +107,29 @@ func (s *ReportStatus) Decode(r io.Reader) error {
 	}
 
 	if !flushed {
-		return fmt.Errorf("missing flush")
+		return fmt.Errorf("missing flush: %w", err)
 	}
 
-	return scan.Err()
+	if err != nil && !errors.Is(err, io.EOF) {
+		// TODO: We should not ignore EOF errors here. Decoding a report-status
+		// message ends with a flush-pkt, an EOF indicates that the flush-pkt
+		// was not received.
+		return err
+	}
+
+	return nil
 }
 
-func (s *ReportStatus) scanFirstLine(scan *pktline.Scanner) error {
-	if scan.Scan() {
-		return nil
+func (s *ReportStatus) scanFirstLine(r io.Reader) ([]byte, error) {
+	_, p, err := pktline.ReadLine(r)
+	if errors.Is(err, io.EOF) {
+		return p, io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	if scan.Err() != nil {
-		return scan.Err()
-	}
-
-	return io.ErrUnexpectedEOF
+	return p, nil
 }
 
 func (s *ReportStatus) decodeReportStatus(b []byte) error {
@@ -151,15 +182,18 @@ func (s *CommandStatus) Error() error {
 		return nil
 	}
 
-	return fmt.Errorf("command error on %s: %s",
-		s.ReferenceName.String(), s.Status)
+	return CommandStatusErr{
+		ReferenceName: s.ReferenceName,
+		Status:        s.Status,
+	}
 }
 
 func (s *CommandStatus) encode(w io.Writer) error {
-	e := pktline.NewEncoder(w)
 	if s.Error() == nil {
-		return e.Encodef("ok %s\n", s.ReferenceName.String())
+		_, err := pktline.Writef(w, "ok %s\n", s.ReferenceName.String())
+		return err
 	}
 
-	return e.Encodef("ng %s %s\n", s.ReferenceName.String(), s.Status)
+	_, err := pktline.Writef(w, "ng %s %s\n", s.ReferenceName.String(), s.Status)
+	return err
 }

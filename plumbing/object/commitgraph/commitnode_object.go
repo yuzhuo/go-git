@@ -4,9 +4,9 @@ import (
 	"math"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 // objectCommitNode is a representation of Commit as presented in the GIT object format.
@@ -79,6 +79,13 @@ func (c *objectCommitNode) ParentHashes() []plumbing.Hash {
 }
 
 func (c *objectCommitNode) Generation() uint64 {
+	// Commit nodes representing objects outside of the commit graph can never
+	// be reached by objects from the commit-graph thus we return the highest
+	// possible value.
+	return math.MaxUint64
+}
+
+func (c *objectCommitNode) GenerationV2() uint64 {
 	// Commit nodes representing objects outside of the commit graph can never
 	// be reached by objects from the commit-graph thus we return the highest
 	// possible value.

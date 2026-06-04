@@ -1,3 +1,4 @@
+// Package frame provides a data structure for storing siblings in a trie.
 package frame
 
 import (
@@ -6,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
 // A Frame is a collection of siblings in a trie, sorted alphabetically
@@ -42,8 +43,9 @@ func New(n noder.Noder) (*Frame, error) {
 // separated by comas.
 //
 // Examples:
-//     []
-//     ["a", "b"]
+//
+//	[]
+//	["a", "b"]
 func (f *Frame) String() string {
 	var buf bytes.Buffer
 	_ = buf.WriteByte('[')
@@ -52,7 +54,7 @@ func (f *Frame) String() string {
 	for i := f.Len() - 1; i >= 0; i-- {
 		_, _ = buf.WriteString(sep)
 		sep = ", "
-		_, _ = buf.WriteString(fmt.Sprintf("%q", f.stack[i].Name()))
+		_, _ = fmt.Fprintf(&buf, "%q", f.stack[i].Name())
 	}
 
 	_ = buf.WriteByte(']')

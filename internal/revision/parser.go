@@ -25,8 +25,7 @@ func (e *ErrInvalidRevision) Error() string {
 // obtained after parsing a revision string,
 // for instance revision "master~" will be converted in
 // two revision components Ref and TildePath
-type Revisioner interface {
-}
+type Revisioner any
 
 // Ref represents a reference name : HEAD, master, <hash>
 type Ref string
@@ -143,7 +142,6 @@ func (p *Parser) Parse() ([]Revisioner, error) {
 
 	for {
 		tok, _, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -159,7 +157,6 @@ func (p *Parser) Parse() ([]Revisioner, error) {
 			rev, err = p.parseColon()
 		case eof:
 			err = p.validateFullRevision(&revs)
-
 			if err != nil {
 				return []Revisioner{}, err
 			}
@@ -255,7 +252,6 @@ func (p *Parser) parseAt() (Revisioner, error) {
 	var err error
 
 	tok, _, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
@@ -267,13 +263,11 @@ func (p *Parser) parseAt() (Revisioner, error) {
 	}
 
 	tok, lit, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
 
 	nextTok, nextLit, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +285,6 @@ func (p *Parser) parseAt() (Revisioner, error) {
 		n, _ := strconv.Atoi(nextLit)
 
 		t, _, err := p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -308,20 +301,20 @@ func (p *Parser) parseAt() (Revisioner, error) {
 
 		for {
 			tok, lit, err = p.scan()
-
 			if err != nil {
 				return nil, err
 			}
 
-			switch {
-			case tok == cbrace:
+			switch tok {
+			case cbrace:
 				t, err := time.Parse("2006-01-02T15:04:05Z", date)
-
 				if err != nil {
 					return nil, &ErrInvalidRevision{fmt.Sprintf(`wrong date "%s" must fit ISO-8601 format : 2006-01-02T15:04:05Z`, date)}
 				}
 
 				return AtDate{t}, nil
+			case eof:
+				return nil, &ErrInvalidRevision{s: `missing "}" in @{<data>} structure`}
 			default:
 				date += lit
 			}
@@ -336,13 +329,12 @@ func (p *Parser) parseTilde() (Revisioner, error) {
 	var err error
 
 	tok, lit, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
 
-	switch {
-	case tok == number:
+	switch tok {
+	case number:
 		n, _ := strconv.Atoi(lit)
 
 		return TildePath{n}, nil
@@ -359,21 +351,19 @@ func (p *Parser) parseCaret() (Revisioner, error) {
 	var err error
 
 	tok, lit, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
 
-	switch {
-	case tok == obrace:
+	switch tok {
+	case obrace:
 		r, err := p.parseCaretBraces()
-
 		if err != nil {
 			return nil, err
 		}
 
 		return r, nil
-	case tok == number:
+	case number:
 		n, _ := strconv.Atoi(lit)
 
 		if n > 2 {
@@ -398,13 +388,11 @@ func (p *Parser) parseCaretBraces() (Revisioner, error) {
 
 	for {
 		tok, lit, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
 
 		nextTok, _, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -424,6 +412,8 @@ func (p *Parser) parseCaretBraces() (Revisioner, error) {
 			p.unscan()
 		case tok != slash && start:
 			return nil, &ErrInvalidRevision{fmt.Sprintf(`"%s" is not a valid revision suffix brace component`, lit)}
+		case tok == eof:
+			return nil, &ErrInvalidRevision{s: `missing "}" in ^{<data>} structure`}
 		case tok != cbrace:
 			p.unscan()
 			re += lit
@@ -431,7 +421,6 @@ func (p *Parser) parseCaretBraces() (Revisioner, error) {
 			p.unscan()
 
 			reg, err := regexp.Compile(re)
-
 			if err != nil {
 				return CaretReg{}, &ErrInvalidRevision{fmt.Sprintf(`revision suffix brace component, %s`, err.Error())}
 			}
@@ -449,7 +438,6 @@ func (p *Parser) parseColon() (Revisioner, error) {
 	var err error
 
 	tok, _, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
@@ -473,13 +461,11 @@ func (p *Parser) parseColonSlash() (Revisioner, error) {
 
 	for {
 		tok, lit, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
 
 		nextTok, _, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -494,7 +480,6 @@ func (p *Parser) parseColonSlash() (Revisioner, error) {
 		case tok == eof:
 			p.unscan()
 			reg, err := regexp.Compile(re)
-
 			if err != nil {
 				return ColonReg{}, &ErrInvalidRevision{fmt.Sprintf(`revision suffix brace component, %s`, err.Error())}
 			}
@@ -514,16 +499,14 @@ func (p *Parser) parseColonDefault() (Revisioner, error) {
 	var path string
 	var stage int
 	var err error
-	var n = -1
+	n := -1
 
 	tok, lit, err = p.scan()
-
 	if err != nil {
 		return nil, err
 	}
 
 	nextTok, _, err := p.scan()
-
 	if err != nil {
 		return nil, err
 	}
@@ -542,7 +525,6 @@ func (p *Parser) parseColonDefault() (Revisioner, error) {
 
 	for {
 		tok, lit, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -567,7 +549,6 @@ func (p *Parser) parseRef() (Revisioner, error) {
 
 	for {
 		tok, lit, err = p.scan()
-
 		if err != nil {
 			return nil, err
 		}
@@ -578,7 +559,6 @@ func (p *Parser) parseRef() (Revisioner, error) {
 		}
 
 		err := p.checkRefFormat(tok, lit, prevTok, buf, endOfRef)
-
 		if err != nil {
 			return "", err
 		}

@@ -5,8 +5,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
 )
 
 // Graceful cancellation example of a basic git operation such as Clone.
@@ -36,11 +36,12 @@ func main() {
 
 	// Using PlainCloneContext we can provide to a context, if the context
 	// is cancelled, the clone operation stops gracefully.
-	_, err := git.PlainCloneContext(ctx, directory, false, &git.CloneOptions{
+	r, err := git.PlainCloneContext(ctx, directory, &git.CloneOptions{
 		URL:      url,
 		Progress: os.Stdout,
 	})
 
 	// If the context was cancelled, an error is returned.
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 }

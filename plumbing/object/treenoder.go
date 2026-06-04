@@ -3,9 +3,9 @@ package object
 import (
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/filemode"
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
 
 // A treenoder is a helper type that wraps git trees into merkletrie
@@ -38,6 +38,10 @@ func NewTreeRootNode(t *Tree) noder.Noder {
 	}
 }
 
+func (t *treeNoder) Skip() bool {
+	return false
+}
+
 func (t *treeNoder) isRoot() bool {
 	return t.name == ""
 }
@@ -48,9 +52,9 @@ func (t *treeNoder) String() string {
 
 func (t *treeNoder) Hash() []byte {
 	if t.mode == filemode.Deprecated {
-		return append(t.hash[:], filemode.Regular.Bytes()...)
+		return append(t.hash.Bytes(), filemode.Regular.Bytes()...)
 	}
-	return append(t.hash[:], t.mode.Bytes()...)
+	return append(t.hash.Bytes(), t.mode.Bytes()...)
 }
 
 func (t *treeNoder) Name() string {
@@ -84,7 +88,9 @@ func (t *treeNoder) Children() ([]noder.Noder, error) {
 		}
 	}
 
-	return transformChildren(parent)
+	var err error
+	t.children, err = transformChildren(parent)
+	return t.children, err
 }
 
 // Returns the children of a tree as treenoders.

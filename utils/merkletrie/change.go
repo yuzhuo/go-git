@@ -1,11 +1,15 @@
 package merkletrie
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v5/utils/merkletrie/noder"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 )
+
+// ErrEmptyFileName is returned when a tree entry has an empty filename.
+var ErrEmptyFileName = errors.New("empty filename in tree entry")
 
 // Action values represent the kind of things a Change can represent:
 // insertion, deletions or modifications of files.
@@ -121,8 +125,14 @@ func (l *Changes) AddRecursiveDelete(root noder.Path) error {
 type noderToChangeFn func(noder.Path) Change // NewInsert or NewDelete
 
 func (l *Changes) addRecursive(root noder.Path, ctor noderToChangeFn) error {
+	if root.String() == "" {
+		return ErrEmptyFileName
+	}
+
 	if !root.IsDir() {
-		l.Add(ctor(root))
+		if !root.Skip() {
+			l.Add(ctor(root))
+		}
 		return nil
 	}
 
@@ -139,7 +149,7 @@ func (l *Changes) addRecursive(root noder.Path, ctor noderToChangeFn) error {
 			}
 			return err
 		}
-		if current.IsDir() {
+		if current.IsDir() || current.Skip() {
 			continue
 		}
 		l.Add(ctor(current))

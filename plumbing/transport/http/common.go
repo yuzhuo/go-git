@@ -1,282 +1,187 @@
-// Package http implements the HTTP transport protocol.
 package http
 
 import (
 	"bytes"
-	"context"
 	"fmt"
-	"net"
 	"net/http"
-	"strconv"
+	"net/url"
 	"strings"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
-	"github.com/go-git/go-git/v5/plumbing/transport"
-	"github.com/go-git/go-git/v5/utils/ioutil"
+	transport "github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/utils/trace"
 )
 
-// it requires a bytes.Buffer, because we need to know the length
-func applyHeadersToRequest(req *http.Request, content *bytes.Buffer, host string, requestType string) {
-	req.Header.Add("User-Agent", "git/1.0")
-	req.Header.Add("Host", host) // host:port
-
-	if content == nil {
-		req.Header.Add("Accept", "*/*")
-		return
-	}
-
-	req.Header.Add("Accept", fmt.Sprintf("application/x-%s-result", requestType))
-	req.Header.Add("Content-Type", fmt.Sprintf("application/x-%s-request", requestType))
-	req.Header.Add("Content-Length", strconv.Itoa(content.Len()))
-}
-
-const infoRefsPath = "/info/refs"
-
-func advertisedReferences(ctx context.Context, s *session, serviceName string) (ref *packp.AdvRefs, err error) {
-	url := fmt.Sprintf(
-		"%s%s?service=%s",
-		s.endpoint.String(), infoRefsPath, serviceName,
-	)
-
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	s.ApplyAuthToRequest(req)
-	applyHeadersToRequest(req, nil, s.endpoint.Host, serviceName)
-	res, err := s.client.Do(req.WithContext(ctx))
-	if err != nil {
-		return nil, err
-	}
-
-	s.ModifyEndpointIfRedirect(res)
-	defer ioutil.CheckClose(res.Body, &err)
-
-	if err = NewErr(res); err != nil {
-		return nil, err
-	}
-
-	ar := packp.NewAdvRefs()
-	if err = ar.Decode(res.Body); err != nil {
-		if err == packp.ErrEmptyAdvRefs {
-			err = transport.ErrEmptyRemoteRepository
-		}
-
-		return nil, err
-	}
-
-	transport.FilterUnsupportedCapabilities(ar.Capabilities)
-	s.advRefs = ar
-
-	return ar, nil
-}
-
-type client struct {
-	c *http.Client
-}
-
-// DefaultClient is the default HTTP client, which uses `http.DefaultClient`.
-var DefaultClient = NewClient(nil)
-
-// NewClient creates a new client with a custom net/http client.
-// See `InstallProtocol` to install and override default http client.
-// Unless a properly initialized client is given, it will fall back into
-// `http.DefaultClient`.
-//
-// Note that for HTTP client cannot distinguish between private repositories and
-// unexistent repositories on GitHub. So it returns `ErrAuthorizationRequired`
-// for both.
-func NewClient(c *http.Client) transport.Transport {
-	if c == nil {
-		return &client{http.DefaultClient}
-	}
-
-	return &client{
-		c: c,
-	}
-}
-
-func (c *client) NewUploadPackSession(ep *transport.Endpoint, auth transport.AuthMethod) (
-	transport.UploadPackSession, error) {
-
-	return newUploadPackSession(c.c, ep, auth)
-}
-
-func (c *client) NewReceivePackSession(ep *transport.Endpoint, auth transport.AuthMethod) (
-	transport.ReceivePackSession, error) {
-
-	return newReceivePackSession(c.c, ep, auth)
-}
-
-type session struct {
-	auth     AuthMethod
-	client   *http.Client
-	endpoint *transport.Endpoint
-	advRefs  *packp.AdvRefs
-}
-
-func newSession(c *http.Client, ep *transport.Endpoint, auth transport.AuthMethod) (*session, error) {
-	s := &session{
-		auth:     basicAuthFromEndpoint(ep),
-		client:   c,
-		endpoint: ep,
-	}
-	if auth != nil {
-		a, ok := auth.(AuthMethod)
-		if !ok {
-			return nil, transport.ErrInvalidAuthMethod
-		}
-
-		s.auth = a
-	}
-
-	return s, nil
-}
-
-func (s *session) ApplyAuthToRequest(req *http.Request) {
-	if s.auth == nil {
-		return
-	}
-
-	s.auth.SetAuth(req)
-}
-
-func (s *session) ModifyEndpointIfRedirect(res *http.Response) {
-	if res.Request == nil {
-		return
-	}
-
-	r := res.Request
-	if !strings.HasSuffix(r.URL.Path, infoRefsPath) {
-		return
-	}
-
-	h, p, err := net.SplitHostPort(r.URL.Host)
-	if err != nil {
-		h = r.URL.Host
-	}
-	if p != "" {
-		port, err := strconv.Atoi(p)
-		if err == nil {
-			s.endpoint.Port = port
-		}
-	}
-	s.endpoint.Host = h
-
-	s.endpoint.Protocol = r.URL.Scheme
-	s.endpoint.Path = r.URL.Path[:len(r.URL.Path)-len(infoRefsPath)]
-}
-
-func (*session) Close() error {
-	return nil
-}
-
-// AuthMethod is concrete implementation of common.AuthMethod for HTTP services
-type AuthMethod interface {
-	transport.AuthMethod
-	SetAuth(r *http.Request)
-}
-
-func basicAuthFromEndpoint(ep *transport.Endpoint) *BasicAuth {
-	u := ep.User
-	if u == "" {
-		return nil
-	}
-
-	return &BasicAuth{u, ep.Password}
-}
-
-// BasicAuth represent a HTTP basic auth
-type BasicAuth struct {
-	Username, Password string
-}
-
-func (a *BasicAuth) SetAuth(r *http.Request) {
-	if a == nil {
-		return
-	}
-
-	r.SetBasicAuth(a.Username, a.Password)
-}
-
-// Name is name of the auth
-func (a *BasicAuth) Name() string {
-	return "http-basic-auth"
-}
-
-func (a *BasicAuth) String() string {
-	masked := "*******"
-	if a.Password == "" {
-		masked = "<empty>"
-	}
-
-	return fmt.Sprintf("%s - %s:%s", a.Name(), a.Username, masked)
-}
-
-// TokenAuth implements an http.AuthMethod that can be used with http transport
-// to authenticate with HTTP token authentication (also known as bearer
-// authentication).
-//
-// IMPORTANT: If you are looking to use OAuth tokens with popular servers (e.g.
-// GitHub, Bitbucket, GitLab) you should use BasicAuth instead. These servers
-// use basic HTTP authentication, with the OAuth token as user or password.
-// Check the documentation of your git server for details.
-type TokenAuth struct {
-	Token string
-}
-
-func (a *TokenAuth) SetAuth(r *http.Request) {
-	if a == nil {
-		return
-	}
-	r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", a.Token))
-}
-
-// Name is name of the auth
-func (a *TokenAuth) Name() string {
-	return "http-token-auth"
-}
-
-func (a *TokenAuth) String() string {
-	masked := "*******"
-	if a.Token == "" {
-		masked = "<empty>"
-	}
-	return fmt.Sprintf("%s - %s", a.Name(), masked)
-}
-
-// Err is a dedicated error to return errors based on status code
+// Err represents an HTTP error response.
 type Err struct {
-	Response *http.Response
+	URL    *url.URL
+	Status int
+	Reason string
 }
 
-// NewErr returns a new Err based on a http response
-func NewErr(r *http.Response) error {
+// StatusCode returns the HTTP status code of the error.
+func (e *Err) StatusCode() int { return e.Status }
+
+func (e *Err) Error() string {
+	format := "unexpected requesting %q status code: %d"
+	if e.Reason != "" {
+		return fmt.Sprintf(format+": %s", e.URL, e.Status, e.Reason)
+	}
+	return fmt.Sprintf(format, e.URL, e.Status)
+}
+
+// checkError maps HTTP response status codes to typed transport errors.
+func checkError(r *http.Response) error {
 	if r.StatusCode >= http.StatusOK && r.StatusCode < http.StatusMultipleChoices {
 		return nil
 	}
 
-	switch r.StatusCode {
-	case http.StatusUnauthorized:
-		return transport.ErrAuthenticationRequired
-	case http.StatusForbidden:
-		return transport.ErrAuthorizationFailed
-	case http.StatusNotFound:
-		return transport.ErrRepositoryNotFound
+	var reason string
+	var messageBuffer bytes.Buffer
+	if r.Body != nil {
+		messageLength, _ := messageBuffer.ReadFrom(r.Body)
+		if messageLength > 0 {
+			reason = messageBuffer.String()
+		}
 	}
 
-	return plumbing.NewUnexpectedError(&Err{r})
+	err := &Err{
+		URL:    r.Request.URL,
+		Status: r.StatusCode,
+		Reason: reason,
+	}
+
+	switch r.StatusCode {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: %w", transport.ErrAuthenticationRequired, err)
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: %w", transport.ErrAuthorizationFailed, err)
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %w", transport.ErrRepositoryNotFound, err)
+	}
+
+	return err
 }
 
-// StatusCode returns the status code of the response
-func (e *Err) StatusCode() int {
-	return e.Response.StatusCode
+const infoRefsPath = "/info/refs"
+
+// applyRedirect derives a new base URL from the final request URL after
+// the HTTP client followed any redirects during the /info/refs GET.
+//
+// The logic mirrors canonical git's update_url_from_redirect(): strip
+// the request-specific tail ("/info/refs") from the final URL to recover
+// the new base. If the tail is missing, the redirect target is
+// inconsistent and we return an error — canonical git die()s here
+// because a mismatch could let a malicious server rewrite the base URL
+// to an unrelated repository.
+//
+// Scheme is validated to prevent SSRF via unsupported protocols (e.g.
+// a redirect to file:// or gopher://). Cross-scheme redirects only
+// permit an upgrade from http to https; downgrades must not influence
+// the session base URL used for subsequent requests.
+func applyRedirect(resp *http.Response, baseURL *url.URL) (*url.URL, error) {
+	if resp.Request == nil {
+		return baseURL, nil
+	}
+
+	final := resp.Request.URL
+	if !strings.HasSuffix(final.Path, infoRefsPath) {
+		return nil, fmt.Errorf(
+			"http transport: redirect target %q does not end with %s",
+			final.Path, infoRefsPath,
+		)
+	}
+	if final.Host == baseURL.Host &&
+		final.Scheme == baseURL.Scheme &&
+		strings.TrimSuffix(final.Path, infoRefsPath) == baseURL.Path {
+		return baseURL, nil
+	}
+
+	if final.Scheme != "http" && final.Scheme != "https" {
+		return nil, fmt.Errorf("http transport: redirect to unsupported scheme %q", final.Scheme)
+	}
+	if final.Scheme != baseURL.Scheme &&
+		(baseURL.Scheme != "http" || final.Scheme != "https") {
+		return nil, fmt.Errorf(
+			"http transport: redirect changes scheme from %q to %q",
+			baseURL.Scheme, final.Scheme,
+		)
+	}
+
+	redirected := *baseURL
+	redirected.Host = final.Host
+	redirected.Scheme = final.Scheme
+	redirected.Path = final.Path[:len(final.Path)-len(infoRefsPath)]
+	return &redirected, nil
 }
 
-func (e *Err) Error() string {
-	return fmt.Sprintf("unexpected requesting %q status code: %d",
-		e.Response.Request.URL, e.Response.StatusCode,
-	)
+var safeHeaders = map[string]struct{}{
+	"User-Agent":        {},
+	"Host":              {},
+	"Accept":            {},
+	"Content-Type":      {},
+	"Content-Length":    {},
+	"Cache-Control":     {},
+	"Git-Protocol":      {},
+	"Transfer-Encoding": {},
+	"Content-Encoding":  {},
+}
+
+func filterHeaders(h http.Header) http.Header {
+	filtered := make(http.Header)
+	for key, values := range h {
+		if _, ok := safeHeaders[http.CanonicalHeaderKey(key)]; ok {
+			filtered[key] = values
+		}
+	}
+	return filtered
+}
+
+func redactedURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if u.User == nil {
+		return u.String()
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return u.String()
+	}
+	redacted := *u
+	redacted.User = url.UserPassword(u.User.Username(), "REDACTED")
+	return redacted.String()
+}
+
+// doRequest performs an HTTP request and returns a typed error on failure.
+func doRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	traceHTTP := trace.HTTP.Enabled()
+	if traceHTTP {
+		trace.HTTP.Printf("requesting %s %s %v", req.Method, redactedURL(req.URL), filterHeaders(req.Header))
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if traceHTTP {
+		trace.HTTP.Printf("response %s %s %s %v", res.Proto, res.Status, redactedURL(res.Request.URL), filterHeaders(res.Header))
+	}
+
+	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+		return res, nil
+	}
+
+	return res, checkError(res)
+}
+
+// applyAuth sets basic auth from URL userinfo and/or the authorizer function.
+func applyAuth(httpReq *http.Request, baseURL *url.URL, authorizer func(*http.Request) error) error {
+	if baseURL.User != nil {
+		password, _ := baseURL.User.Password()
+		httpReq.SetBasicAuth(baseURL.User.Username(), password)
+	}
+	if authorizer != nil {
+		return authorizer(httpReq)
+	}
+	return nil
 }

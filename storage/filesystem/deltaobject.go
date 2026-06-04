@@ -1,7 +1,7 @@
 package filesystem
 
 import (
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 type deltaObject struct {
@@ -15,7 +15,8 @@ func newDeltaObject(
 	obj plumbing.EncodedObject,
 	hash plumbing.Hash,
 	base plumbing.Hash,
-	size int64) plumbing.DeltaObject {
+	size int64,
+) plumbing.DeltaObject {
 	return &deltaObject{
 		EncodedObject: obj,
 		hash:          hash,

@@ -3,7 +3,14 @@ package plumbing
 import (
 	"bytes"
 	"io"
+
+	"github.com/go-git/go-git/v6/plumbing/format/config"
 )
+
+// NewMemoryObject returns a new MemoryObject with the given ObjectHasher.
+func NewMemoryObject(oh *ObjectHasher) *MemoryObject {
+	return &MemoryObject{oh: oh}
+}
 
 // MemoryObject on memory Object implementation
 type MemoryObject struct {
@@ -11,6 +18,7 @@ type MemoryObject struct {
 	h    Hash
 	cont []byte
 	sz   int64
+	oh   *ObjectHasher
 }
 
 // Hash returns the object Hash, the hash is calculated on-the-fly the first
@@ -18,25 +26,39 @@ type MemoryObject struct {
 // if the type or the content have changed. The Hash is only generated if the
 // size of the content is exactly the object size.
 func (o *MemoryObject) Hash() Hash {
-	if o.h == ZeroHash && int64(len(o.cont)) == o.sz {
-		o.h = ComputeHash(o.t, o.cont)
+	if o.h.IsZero() && int64(len(o.cont)) == o.sz {
+		// TODO: Ensure that every MemoryObject has an object hasher.
+		if o.oh == nil {
+			o.oh = FromObjectFormat(config.SHA1)
+		}
+		h, err := o.oh.Compute(o.t, o.cont)
+		if err != nil {
+			return ZeroHash
+		}
+		o.h = h
+	}
+
+	if o.h.IsZero() {
+		return ZeroHash
 	}
 
 	return o.h
 }
 
-// Type return the ObjectType
+// Type returns the ObjectType
 func (o *MemoryObject) Type() ObjectType { return o.t }
 
 // SetType sets the ObjectType
 func (o *MemoryObject) SetType(t ObjectType) { o.t = t }
 
-// Size return the size of the object
+// Size returns the size of the object
 func (o *MemoryObject) Size() int64 { return o.sz }
 
 // SetSize set the object size, a content of the given size should be written
 // afterwards
-func (o *MemoryObject) SetSize(s int64) { o.sz = s }
+func (o *MemoryObject) SetSize(s int64) {
+	o.sz = s
+}
 
 // Reader returns an io.ReadCloser used to read the object's content.
 //

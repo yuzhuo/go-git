@@ -1,10 +1,11 @@
 package object
 
 import (
+	"errors"
 	"io"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 type bfsCommitIterator struct {
@@ -86,7 +87,7 @@ func (w *bfsCommitIterator) ForEach(cb func(*Commit) error) error {
 		}
 
 		err = cb(c)
-		if err == storer.ErrStop {
+		if errors.Is(err, storer.ErrStop) {
 			break
 		}
 		if err != nil {

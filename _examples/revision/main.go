@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-git/go-git/v5"
-	. "github.com/go-git/go-git/v5/_examples"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6"
+	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // Example how to resolve a revision into its commit counterpart
@@ -19,6 +19,7 @@ func main() {
 	// We instantiate a new repository targeting the given path (the .git folder)
 	r, err := git.PlainOpen(path)
 	CheckIfError(err)
+	defer func() { _ = r.Close() }()
 
 	// Resolve revision into a sha1 commit, only some revisions are resolved
 	// look at the doc to get more details
